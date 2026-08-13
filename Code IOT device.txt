@@ -1,0 +1,239 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <EEPROM.h>
+
+// --- ตั้งค่า Wi-Fi และ Firebase ---
+#define WIFI_SSID "Yiwa F4"
+#define WIFI_PASSWORD "Bang4567"
+#define FIREBASE_HOST "water-tank-iot-8c113-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "qKEAYzn9dc31GnN38eAaHFtmUWcIxyilFFh43beN"
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define TRIG_PIN 25
+#define ECHO_PIN 18
+#define BUTTON_PIN 0
+
+#define EEPROM_SIZE 8  // float 2 ตัว × 4 bytes
+
+FirebaseData firebaseData;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+float TANK_DEPTH    = 114.0;
+float TANK_CAPACITY = 400.0;
+
+float previousWaterHeight = 0.0;
+float smoothPercent       = 0.0;
+int   rawWaterPercent     = 0;
+float currentWaterHeight  = 0.0;
+unsigned long lastButtonPress = 0;
+
+const float SAFE_ZONE = 2.5;
+
+unsigned long lastSensorReadTime   = 0;
+unsigned long lastFlowCheckTime    = 0;
+unsigned long lastFirebaseCheckTime = 0;
+
+const unsigned long SENSOR_READ_INTERVAL   = 1000;
+const unsigned long FLOW_CHECK_INTERVAL    = 5000;
+const unsigned long FIREBASE_CHECK_INTERVAL = 3000;
+
+String flowStatus = "NO FLOW";
+
+// -------------------------------------------------------
+float readUltrasonic() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return 0;
+  return duration * 0.034 / 2;
+}
+
+// -------------------------------------------------------
+void drawWaterTank(int x, int y, int w, int h, int percent) {
+  display.drawRoundRect(x, y, w, h, 4, SSD1306_WHITE);
+  display.drawRect(x + 2, y - 2, w - 4, 2, SSD1306_WHITE);
+  display.drawRect(x - 2, y + 4, 2, 2, SSD1306_WHITE);
+  display.drawRect(x + w, y + 4, 2, 2, SSD1306_WHITE);
+  int maxWaterHeight = h - 6;
+  int fillH = maxWaterHeight * percent / 100;
+  if (fillH > 0) {
+    display.fillRect(x + 2, y + (h - 2) - fillH, w - 4, fillH, SSD1306_WHITE);
+  }
+}
+
+// -------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for (;;); }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // โหลดค่าที่บันทึกไว้จาก EEPROM
+  float savedDepth, savedCapacity;
+  EEPROM.get(0, savedDepth);
+  EEPROM.get(4, savedCapacity);
+
+  if (!isnan(savedDepth) && savedDepth > 10.0 && savedDepth < 500.0) {
+    TANK_DEPTH = savedDepth;
+    Serial.printf("[EEPROM] โหลด TANK_DEPTH = %.1f ซม.\n", TANK_DEPTH);
+  }
+  if (!isnan(savedCapacity) && savedCapacity > 10.0 && savedCapacity < 50000.0) {
+    TANK_CAPACITY = savedCapacity;
+    Serial.printf("[EEPROM] โหลด TANK_CAPACITY = %.0f ลิตร\n", TANK_CAPACITY);
+  }
+
+  // เชื่อม Wi-Fi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int wifiCounter = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiCounter < 20) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(10, 25);
+    display.print("Connecting Wi-Fi...");
+    display.display();
+    delay(500);
+    wifiCounter++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    config.host = FIREBASE_HOST;
+    config.signer.tokens.legacy_token = FIREBASE_AUTH;
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+    Serial.println("=================================");
+    Serial.println("บอร์ดออนไลน์สำเร็จ!");
+    Serial.println("=================================");
+  }
+}
+
+// -------------------------------------------------------
+void loop() {
+
+  // ปุ่ม calibrate (เผื่อใช้งานในอนาคต)
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    if (millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+    }
+  }
+
+  // ---- อ่านค่า tank_depth และ tank_capacity จาก Firebase โดยตรง ----
+  if (WiFi.status() == WL_CONNECTED) {
+    if (millis() - lastFirebaseCheckTime >= FIREBASE_CHECK_INTERVAL) {
+
+      bool depthOk   = Firebase.getFloat(firebaseData, "/water_system/setting/tank_depth");
+      float newDepth = depthOk ? firebaseData.floatData() : -1;
+
+      bool capOk     = Firebase.getFloat(firebaseData, "/water_system/setting/tank_capacity");
+      float newCap   = capOk ? firebaseData.floatData() : -1;
+
+      if (depthOk && capOk && newDepth > 10.0 && newCap > 10.0) {
+        if (newDepth != TANK_DEPTH || newCap != TANK_CAPACITY) {
+          TANK_DEPTH    = newDepth;
+          TANK_CAPACITY = newCap;
+          EEPROM.put(0, TANK_DEPTH);
+          EEPROM.put(4, TANK_CAPACITY);
+          EEPROM.commit();
+          Serial.printf("[OK] รับค่าจากแอป: %.0f ลิตร / %.1f ซม.\n", TANK_CAPACITY, TANK_DEPTH);
+        }
+      } else {
+        if (!depthOk) Serial.println("❌ อ่าน tank_depth ล้มเหลว: " + firebaseData.errorReason());
+        if (!capOk)   Serial.println("❌ อ่าน tank_capacity ล้มเหลว: " + firebaseData.errorReason());
+      }
+
+      lastFirebaseCheckTime = millis();
+    }
+  }
+
+  // ---- อ่านเซนเซอร์ระดับน้ำทุก 1 วินาที ----
+  if (millis() - lastSensorReadTime >= SENSOR_READ_INTERVAL) {
+    float distanceCm = readUltrasonic();
+    float effectiveDistance = distanceCm - SAFE_ZONE;
+    if (effectiveDistance < 0) effectiveDistance = 0;
+
+    currentWaterHeight = TANK_DEPTH - effectiveDistance;
+    if (currentWaterHeight < 0)            currentWaterHeight = 0;
+    if (currentWaterHeight > TANK_DEPTH)   currentWaterHeight = TANK_DEPTH;
+
+    rawWaterPercent = (int)((currentWaterHeight / TANK_DEPTH) * 100.0);
+    lastSensorReadTime = millis();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      int currentLiters = (int)((rawWaterPercent / 100.0) * TANK_CAPACITY);
+      Firebase.setInt(firebaseData,   "/water_system/monitor/water_level_liters", currentLiters);
+      float currentFlowRate = (flowStatus == "FLOW") ? 14.5 : 0.0;
+      Firebase.setFloat(firebaseData, "/water_system/monitor/flow_rate_min", currentFlowRate);
+    }
+  }
+
+  // ---- ตรวจสอบการไหลของน้ำทุก 5 วินาที ----
+  if (millis() - lastFlowCheckTime >= FLOW_CHECK_INTERVAL) {
+    flowStatus = (currentWaterHeight > previousWaterHeight + 0.4) ? "FLOW" : "NO FLOW";
+    previousWaterHeight = currentWaterHeight;
+    lastFlowCheckTime   = millis();
+  }
+
+  // ---- Smooth animation ----
+  if (smoothPercent < rawWaterPercent) {
+    smoothPercent += 0.5;
+    if (smoothPercent > rawWaterPercent) smoothPercent = rawWaterPercent;
+  } else if (smoothPercent > rawWaterPercent) {
+    smoothPercent -= 0.5;
+    if (smoothPercent < rawWaterPercent) smoothPercent = rawWaterPercent;
+  }
+
+  int displayPercent = (int)smoothPercent;
+  int waterLiters    = (int)((displayPercent / 100.0) * TANK_CAPACITY);
+
+  // ---- วาดหน้าจอ OLED ----
+  display.clearDisplay();
+
+  display.setTextSize(2);
+  display.setCursor(4, 18);
+  display.print(displayPercent);
+  display.setTextSize(1);
+  display.print("%");
+
+  drawWaterTank(52, 6, 24, 42, displayPercent);
+
+  display.setTextSize(1);
+  display.setCursor(46, 50);
+  display.print("H:");
+  display.print((int)TANK_DEPTH);
+
+  display.setCursor(110, 50);
+  display.print(WiFi.status() == WL_CONNECTED ? "[ON]" : "[OFF]");
+
+  if (flowStatus == "FLOW") {
+    display.setCursor(88, 18); display.print("FLOW");
+    display.setCursor(88, 28); display.print(">>>");
+  } else {
+    display.setCursor(84, 22); display.print("NO FLOW");
+  }
+
+  display.setTextSize(1);
+  display.setCursor(4, 56);
+  display.print(waterLiters);
+  display.print(" / ");
+  display.print((int)TANK_CAPACITY);
+  display.print(" L");
+
+  display.display();
+  delay(50);
+}

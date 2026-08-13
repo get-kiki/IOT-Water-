@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "774815603608",
+    "firebase_url": "https://water-tank-iot-8c113-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "water-tank-iot-8c113",
+    "storage_bucket": "water-tank-iot-8c113.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:774815603608:android:73456953ce4a750c73a9ed",
+        "android_client_info": {
+          "package_name": "com.example.flutter_application_1"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCHCshsmhRVuGdvO3a2JKUhGRkctcaK3Ag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
