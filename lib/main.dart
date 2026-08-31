@@ -29,6 +29,95 @@ class MyApp extends StatelessWidget {
   }
 }
 
+// 📦 ข้อมูลขนาดแทงค์ที่แยกส่วนไว้แล้ว ใช้แสดงผลบนการ์ดให้อ่านง่ายขึ้น
+class _TankSizeInfo {
+  final String dimensions; // เช่น "93 × 185 ซม."
+  final String liters; // เช่น "1,000 ลิตร"
+  final String? tag; // "นิยม" / "นิยมที่สุด" หรือ null
+
+  _TankSizeInfo({required this.dimensions, required this.liters, this.tag});
+}
+
+_TankSizeInfo _parseTankSize(String raw) {
+  String? tag;
+  String base = raw;
+  if (raw.contains(' (นิยมที่สุด)')) {
+    tag = 'นิยมที่สุด';
+    base = raw.replaceAll(' (นิยมที่สุด)', '');
+  } else if (raw.contains(' (นิยม)')) {
+    tag = 'นิยม';
+    base = raw.replaceAll(' (นิยม)', '');
+  }
+
+  final parts = base.split(' ซม. ความจุ ');
+  final dimensions = '${parts[0].replaceAll('*', ' × ')} ซม.';
+  final liters = parts.length > 1 ? parts[1] : '';
+
+  return _TankSizeInfo(dimensions: dimensions, liters: liters, tag: tag);
+}
+
+// 🛢️ ไอคอนรูปแทงค์น้ำขนาดเล็ก วาดเองจากกล่องซ้อนกัน (โครงถัง + ระดับน้ำ + ฝาถัง)
+// ใช้รูปเดียวกันทุกรายการ ไม่ไล่ระดับตามความจุ
+class _MiniTankIcon extends StatelessWidget {
+  static const double _fillFactor = 0.6;
+  final Color color;
+
+  const _MiniTankIcon({required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 16,
+      height: 24,
+      child: Stack(
+        fit: StackFit.expand,
+        alignment: Alignment.bottomCenter,
+        children: [
+          // โครงถัง (ขอบ)
+          Container(
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.15),
+              border: Border.all(color: color, width: 1.4),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(4),
+                bottom: Radius.circular(2),
+              ),
+            ),
+          ),
+          // ระดับน้ำภายในถัง
+          ClipRRect(
+            borderRadius: const BorderRadius.vertical(
+              top: Radius.circular(3),
+              bottom: Radius.circular(1),
+            ),
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: FractionallySizedBox(
+                heightFactor: _fillFactor,
+                widthFactor: 1,
+                child: Container(color: color),
+              ),
+            ),
+          ),
+          // ฝาถังด้านบน
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: Container(
+              height: 2.2,
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key, required this.title});
 
@@ -54,6 +143,9 @@ class _MyHomePageState extends State<MyHomePage> {
   // 🚀 flag กันผู้ใช้กดปุ่มซ้ำระหว่างรอ Firebase ตอบกลับ
   bool _isSaving = false;
 
+  // 🎯 ดัชนีของขนาดมาตรฐานที่ถูกเลือกอยู่ (ไว้ไฮไลต์การ์ด), null = ยังไม่เลือก/พิมพ์เอง
+  int? _selectedTemplateIndex;
+
   // รายการขนาดแทงค์น้ำมาตรฐาน
   final List<String> _tankSizes = [
     '74*114 ซม. ความจุ 400 ลิตร',
@@ -67,7 +159,7 @@ class _MyHomePageState extends State<MyHomePage> {
   ];
 
   // ฟังก์ชันแยกตัวเลขจากข้อความปุ่มมาตรฐาน เพื่อเอาไปเติมในช่องกรอกข้อมูล
-  void _fillControllerFromTemplate(String sizeTemplate) {
+  void _fillControllerFromTemplate(int index, String sizeTemplate) {
     try {
       // 1. แยกส่วนกว้างสูง ออกจากส่วนลิตร ด้วยคำว่า " ซม."
       final parts = sizeTemplate.split(' ซม.');
@@ -89,11 +181,19 @@ class _MyHomePageState extends State<MyHomePage> {
         _widthController.text = width;
         _heightController.text = height;
         _literController.text = liters;
+        _selectedTemplateIndex = index;
       });
 
       _showSnackBar('ดึงค่าเข้าช่องกรอกแล้ว กรุณากดปุ่มบันทึกเพื่อยืนยัน');
     } catch (e) {
       _showSnackBar('ไม่สามารถดึงข้อมูลขนาดได้: $e');
+    }
+  }
+
+  // ⌨️ เมื่อผู้ใช้แก้ไขช่องกรอกเอง ให้เลิกไฮไลต์การ์ดที่เคยเลือกไว้ (ค่าจริงไม่ตรงกันแล้ว)
+  void _onManualEdit() {
+    if (_selectedTemplateIndex != null) {
+      setState(() => _selectedTemplateIndex = null);
     }
   }
 
@@ -182,7 +282,12 @@ class _MyHomePageState extends State<MyHomePage> {
   void _showSnackBar(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
     );
   }
 
@@ -197,198 +302,341 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color.fromARGB(255, 209, 219, 226),
       appBar: AppBar(
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
+        elevation: 0,
         title: Text(widget.title),
       ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 400),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Expanded(
-                  child: ListView.builder(
-                    itemCount: _tankSizes.length,
-                    itemBuilder: (context, index) {
-                      final size = _tankSizes[index];
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 24),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 460),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _buildHeader(),
+                  const SizedBox(height: 20),
+                  ..._tankSizes.asMap().entries.map(
+                        (e) => _buildSizeCard(e.key, e.value),
+                      ),
+                  const SizedBox(height: 8),
+                  _buildOrDivider(),
+                  const SizedBox(height: 16),
+                  _buildCustomSizeCard(),
+                  const SizedBox(height: 20),
+                  _buildSaveButton(),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
-                      String mainText = size;
-                      String popularText = '';
+  // -----------------------------------------------------------------
+  // 🏷️ ส่วนหัว: ไอคอนและคำอธิบายสั้นๆ
+  // -----------------------------------------------------------------
+  Widget _buildHeader() {
+    return Column(
+      children: [
+        Container(
+          width: 64,
+          height: 64,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Colors.blue.shade300, Colors.blue.shade600],
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.blue.withOpacity(0.35),
+                blurRadius: 14,
+                offset: const Offset(0, 6),
+              ),
+            ],
+          ),
+          child: const Icon(Icons.water_drop, color: Colors.white, size: 32),
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          'เลือกขนาดแทงค์น้ำ',
+          style: TextStyle(
+            fontSize: 19,
+            fontWeight: FontWeight.bold,
+            color: Colors.black87,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'แตะเลือกจากขนาดมาตรฐาน หรือกำหนดขนาดเองด้านล่าง',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 12.5, color: Colors.grey.shade600),
+        ),
+      ],
+    );
+  }
 
-                      if (size.contains(' (นิยมที่สุด)')) {
-                        mainText = size.replaceAll(' (นิยมที่สุด)', '');
-                        popularText = ' (นิยมที่สุด)';
-                      } else if (size.contains(' (นิยม)')) {
-                        mainText = size.replaceAll(' (นิยม)', '');
-                        popularText = ' (นิยม)';
-                      }
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 12.0),
-                        child: InkWell(
-                          onTap: () => _fillControllerFromTemplate(size),
-                          borderRadius: BorderRadius.circular(12.0),
-                          child: Container(
-                            height: 48,
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(12.0),
-                              border: Border.all(
-                                color: Colors.blue.shade200,
-                                width: 1.5,
-                              ),
-                            ),
-                            alignment: Alignment.center,
-                            child: RichText(
-                              textAlign: TextAlign.center,
-                              text: TextSpan(
-                                style: const TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.blue,
-                                ),
-                                children: [
-                                  TextSpan(text: mainText),
-                                  if (popularText.isNotEmpty)
-                                    TextSpan(
-                                      text: popularText,
-                                      style: const TextStyle(
-                                        color: Colors.grey,
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.normal,
-                                      ),
-                                    ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
+  // -----------------------------------------------------------------
+  // 🛢️ การ์ดขนาดแทงค์มาตรฐานแต่ละรายการ
+  // -----------------------------------------------------------------
+  Widget _buildSizeCard(int index, String size) {
+    final info = _parseTankSize(size);
+    final bool isSelected = _selectedTemplateIndex == index;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10.0),
+      child: InkWell(
+        onTap: () => _fillControllerFromTemplate(index, size),
+        borderRadius: BorderRadius.circular(14.0),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: isSelected ? Colors.blue.shade50 : Colors.white,
+            borderRadius: BorderRadius.circular(14.0),
+            border: Border.all(
+              color: isSelected ? Colors.blue : Colors.grey.shade200,
+              width: isSelected ? 1.8 : 1,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.05),
+                blurRadius: 8,
+                offset: const Offset(0, 3),
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: isSelected ? Colors.blue : Colors.blue.shade50,
+                  borderRadius: BorderRadius.circular(12),
                 ),
-
-                const SizedBox(height: 8),
-                const Divider(),
-                const SizedBox(height: 8),
-
-                // =========================================================
-                // ส่วนที่ 3: ช่องกรอกข้อมูล (รับค่าอัตโนมัติจากการกดลิสต์ หรือพิมพ์เองก็ได้)
-                // =========================================================
-                const Text(
-                  'ระบุขนาดแทงค์น้ำ (กว้าง * สูง และ ความจุ):',
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.blue,
-                  ),
+                child: _MiniTankIcon(
+                  color: isSelected ? Colors.white : Colors.blue,
                 ),
-                const SizedBox(height: 8),
-                Row(
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // ช่องกรอก ความกว้าง
-                    Expanded(
-                      child: SizedBox(
-                        height: 50,
-                        child: TextField(
-                          controller: _widthController,
-                          keyboardType: TextInputType.number,
-                          decoration: InputDecoration(
-                            labelText: 'กว้าง (ซม.)',
-                            labelStyle: const TextStyle(fontSize: 12),
-                            contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                            ),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(8),
-                            ),
+                    Row(
+                      children: [
+                        Text(
+                          info.dimensions,
+                          style: const TextStyle(
+                            fontSize: 14.5,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.black87,
                           ),
                         ),
-                      ),
+                        if (info.tag != null) ...[
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.orange.shade50,
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(color: Colors.orange.shade200),
+                            ),
+                            child: Text(
+                              info.tag!,
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.orange.shade700,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
-                    const SizedBox(width: 6),
-                    // ช่องกรอก ความสูง
-                    Expanded(
-                      child: SizedBox(
-                        height: 50,
-                        child: TextField(
-                          controller: _heightController,
-                          keyboardType: TextInputType.number,
-                          decoration: InputDecoration(
-                            labelText: 'สูง (ซม.)',
-                            labelStyle: const TextStyle(fontSize: 12),
-                            contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                            ),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    // ช่องกรอก ปริมาตรลิตร
-                    Expanded(
-                      child: SizedBox(
-                        height: 50,
-                        child: TextField(
-                          controller: _literController,
-                          keyboardType: TextInputType.number,
-                          decoration: InputDecoration(
-                            labelText: 'ความจุ (ลิตร)',
-                            labelStyle: const TextStyle(fontSize: 12),
-                            contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                            ),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                          ),
-                        ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'ความจุ ${info.liters}',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        color: Colors.grey.shade600,
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 10),
-                // ปุ่มบันทึกข้อมูลและนำทางไปหน้า watertank.dart
-                SizedBox(
-                  height: 48,
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.blue,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12.0),
-                      ),
-                    ),
-                    // 🚀 ปิดปุ่มระหว่างกำลังบันทึก กันกดซ้ำ
-                    onPressed: _isSaving ? null : _handleCustomSizeSubmit,
-                    icon: _isSaving
-                        ? const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              color: Colors.white,
-                            ),
-                          )
-                        : const Icon(Icons.save),
-                    label: Text(
-                      _isSaving ? 'กำลังบันทึก...' : 'บันทึกข้อมูลขนาดแทงค์',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 15,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+              ),
+              Icon(
+                isSelected ? Icons.check_circle : Icons.chevron_right,
+                color: isSelected ? Colors.blue : Colors.grey.shade300,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // -----------------------------------------------------------------
+  // ➖ เส้นแบ่ง "หรือกำหนดขนาดเอง"
+  // -----------------------------------------------------------------
+  Widget _buildOrDivider() {
+    return Row(
+      children: [
+        Expanded(child: Divider(color: Colors.grey.shade300)),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          child: Text(
+            'หรือกำหนดขนาดเอง',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: Colors.grey.shade600,
             ),
           ),
+        ),
+        Expanded(child: Divider(color: Colors.grey.shade300)),
+      ],
+    );
+  }
+
+  // -----------------------------------------------------------------
+  // ✏️ การ์ดกรอกขนาดเอง (กว้าง / สูง / ความจุ)
+  // -----------------------------------------------------------------
+  Widget _buildCustomSizeCard() {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18.0),
+        border: Border.all(color: Colors.grey.shade200),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.05),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.tune, color: Colors.blue.shade600, size: 18),
+              const SizedBox(width: 8),
+              const Text(
+                'กำหนดขนาดเอง',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.black87,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: _buildSizeField(
+                  controller: _widthController,
+                  label: 'กว้าง (ซม.)',
+                  icon: Icons.straighten,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _buildSizeField(
+                  controller: _heightController,
+                  label: 'สูง (ซม.)',
+                  icon: Icons.height,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _buildSizeField(
+                  controller: _literController,
+                  label: 'ความจุ (ลิตร)',
+                  icon: Icons.opacity,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSizeField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+  }) {
+    return TextField(
+      controller: controller,
+      keyboardType: TextInputType.number,
+      onChanged: (_) => _onManualEdit(),
+      style: const TextStyle(fontSize: 14),
+      decoration: InputDecoration(
+        labelText: label,
+        labelStyle: const TextStyle(fontSize: 11.5),
+        prefixIcon: Icon(icon, size: 18, color: Colors.blue.shade300),
+        filled: true,
+        fillColor: Colors.grey.shade50,
+        contentPadding: const EdgeInsets.symmetric(vertical: 12),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: BorderSide.none,
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: BorderSide(color: Colors.blue.shade400, width: 1.4),
+        ),
+      ),
+    );
+  }
+
+  // -----------------------------------------------------------------
+  // 💾 ปุ่มบันทึกข้อมูลและนำทางไปหน้า watertank.dart
+  // -----------------------------------------------------------------
+  Widget _buildSaveButton() {
+    return SizedBox(
+      height: 54,
+      child: ElevatedButton.icon(
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.blue,
+          foregroundColor: Colors.white,
+          elevation: 3,
+          shadowColor: Colors.blue.withOpacity(0.4),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16.0),
+          ),
+        ),
+        // 🚀 ปิดปุ่มระหว่างกำลังบันทึก กันกดซ้ำ
+        onPressed: _isSaving ? null : _handleCustomSizeSubmit,
+        icon: _isSaving
+            ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white,
+                ),
+              )
+            : const Icon(Icons.save),
+        label: Text(
+          _isSaving ? 'กำลังบันทึก...' : 'บันทึกข้อมูลขนาดแทงค์',
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
         ),
       ),
     );

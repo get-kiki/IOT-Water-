@@ -3,6 +3,8 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'history.dart'; // นำเข้าหน้า HistoryPage เพื่อใช้ใน BottomNavigationBar
+import 'notification.dart'; // นำเข้าหน้า NotificationPage เพื่อใช้ใน BottomNavigationBar
+import 'active.dart'; // นำเข้าหน้า ActivityPage เพื่อใช้ใน BottomNavigationBar
 
 class WaterTankPage extends StatefulWidget {
   const WaterTankPage({super.key});
@@ -175,9 +177,10 @@ class _WaterTankPageState extends State<WaterTankPage>
         index: _selectedIndex,
         children: [
           _buildMainWaterTankView(), // ดัชนี 0: หน้าถังน้ำเรียลไทม์
-          _buildPlaceholderView('หน้าจอประวัติการใช้งาน'), // ดัชนี 1
-          _buildPlaceholderView('หน้าจอสถานะทำงาน'), // ดัชนี 2
-          _buildPlaceholderView('หน้าจอระบบวิเคราะห์ AI'), // ดัชนี 3
+          const HistoryPage(), // ดัชนี 1: หน้าจอประวัติการใช้น้ำ
+          const ActivityPage(), // ดัชนี 2: หน้าจอกิจกรรม
+          _buildPlaceholderView('หน้าจอ AI'), // ดัชนี 3
+          const NotificationPage(), // ดัชนี 4: หน้าจอการแจ้งเตือน
         ],
       ),
 
@@ -202,12 +205,16 @@ class _WaterTankPageState extends State<WaterTankPage>
           ),
           BottomNavigationBarItem(
             icon: Icon(Icons.assessment),
-            label: 'ประวัติการใช้งาน',
+            label: 'ประวัติการใช้น้ำ',
           ),
-          BottomNavigationBarItem(icon: Icon(Icons.bolt), label: 'สถานะทำงาน'),
+          BottomNavigationBarItem(icon: Icon(Icons.bolt), label: 'กิจกรรม'),
           BottomNavigationBarItem(
             icon: Icon(Icons.psychology),
-            label: 'วิเคราะห์ AI',
+            label: 'AI',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.notifications),
+            label: 'การแจ้งเตือน',
           ),
         ],
       ),
@@ -746,11 +753,13 @@ class _WaterTankPageState extends State<WaterTankPage>
       case 0:
         return 'ปริมาณน้ำในแทงค์ (Real-time)';
       case 1:
-        return 'ประวัติย้อนหลัง';
+        return 'ประวัติการใช้น้ำ';
       case 2:
-        return 'สถานะการทำงานระบบ';
+        return 'กิจกรรม';
       case 3:
         return 'ระบบวิเคราะห์ข้อมูล AI';
+      case 4:
+        return 'การแจ้งเตือน';
       default:
         return 'Water Tank IoT';
     }
