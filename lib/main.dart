@@ -4,11 +4,14 @@ import 'package:firebase_database/firebase_database.dart';
 
 // 🚀 เชื่อมโยงไปที่ไฟล์ watertank.dart ของคุณ
 import 'watertank.dart';
+import 'firebase_options.dart';
 
 void main() async {
   // บังคับให้จัดการทำงานแบบ Async และผูกระบบกับ Firebase ก่อนเปิดแอป
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
   runApp(const MyApp());
 }
 
