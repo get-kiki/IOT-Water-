@@ -1,0 +1,93 @@
+#include <WiFi.h>
+#include <WiFiManager.h>      // 🚀 เพิ่มไลบรารี WiFiManager
+#include <FirebaseESP32.h>
+
+// --- ตั้งค่า Firebase ---
+#define FIREBASE_HOST "water-tank-iot-8c113-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "qKEAYzn9dc31GnN38eAaHFtmUWcIxyilFFh43beN"
+
+#define FLOW_SENSOR_PIN 27  // ขา Signal ของ YF-S201 Flow Sensor
+
+// YF-S201: ความถี่พัลส์ (Hz) = 7.5 * อัตราการไหล (L/min)  =>  450 พัลส์ ต่อ 1 ลิตร
+#define FLOW_CALIBRATION_FACTOR 450.0
+
+FirebaseData firebaseData;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+volatile unsigned long flowPulseCount = 0;
+float currentFlowRate = 0.0;
+String flowStatus = "NO FLOW";
+
+unsigned long lastFlowCheckTime = 0;
+const unsigned long FLOW_CHECK_INTERVAL = 1000; // คำนวณทุก 1 วินาที
+
+void IRAM_ATTR onFlowPulse() {
+  flowPulseCount++;
+}
+
+// -------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onFlowPulse, FALLING);
+
+  // 🚀 --- เริ่มระบบ WiFiManager ---
+  WiFiManager wm;
+  
+  // (เลือกได้) รีเซ็ตค่า Wi-Fi เดิมที่เคยจำไว้เพื่อทดสอบระบบ
+  // wm.resetSettings(); 
+
+  Serial.println("กำลังเชื่อมต่อ Wi-Fi หรือเปิด AP Mode...");
+  
+  // สร้าง Access Point ชื่อ "FlowSensor_Setup" รหัสผ่าน "12345678" 
+  // หากเชื่อม Wi-Fi เก่าไม่ได้ บอร์ดจะปล่อย Wi-Fi ชื่อนี้ออกมา
+  bool res = wm.autoConnect("FlowSensor_Setup", "12345678");
+
+  if (!res) {
+    Serial.println("เชื่อมต่อ Wi-Fi ไม่สำเร็จ และหมดเวลาในการตั้งค่า");
+    ESP.restart(); // รีสตาร์ทตัวเองเพื่อลองใหม่
+  }
+
+  // หากโค้ดทำงานมาถึงตรงนี้ แปลว่าเชื่อมต่อ Wi-Fi ได้แล้ว
+  Serial.println("\nเชื่อมต่อ Wi-Fi สำเร็จแล้ว!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // --- เชื่อมต่อ Firebase ---
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Serial.println("\n=================================");
+  Serial.println("Flow Sensor Board ออนไลน์สำเร็จ!");
+  Serial.println("=================================");
+
+  lastFlowCheckTime = millis();
+}
+
+// -------------------------------------------------------
+void loop() {
+  if (millis() - lastFlowCheckTime >= FLOW_CHECK_INTERVAL) {
+    unsigned long elapsedMs = millis() - lastFlowCheckTime;
+
+    noInterrupts();
+    unsigned long pulses = flowPulseCount;
+    flowPulseCount = 0;
+    interrupts();
+
+    currentFlowRate = (pulses / FLOW_CALIBRATION_FACTOR) * (60000.0 / elapsedMs);
+    flowStatus = (currentFlowRate > 0.5) ? "FLOW" : "NO FLOW"; 
+    lastFlowCheckTime = millis();
+
+    Serial.printf("[Flow] %.2f L/min (%s)\n", currentFlowRate, flowStatus.c_str());
+
+    // ส่งค่าขึ้น Firebase ถ้ายังต่อ Wi-Fi อยู่
+    if (WiFi.status() == WL_CONNECTED) {
+      Firebase.setFloat(firebaseData, "/water_system/monitor/flow_rate_min", currentFlowRate);
+    } else {
+      Serial.println("Wi-Fi ขาดการเชื่อมต่อ...");
+    }
+  }
+}

@@ -3,8 +3,16 @@ import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
 
 // 📦 Firebase schema ที่หน้านี้คาดหวัง:
-// water_system/history/{yyyy-MM-dd}: { used_liters: <number> }
-// แต่ละ key คือยอดน้ำที่ใช้ไปทั้งหมดของวันนั้น (ฝั่งบอร์ดเซนเซอร์เป็นคนอัปเดตทับทุกครั้งที่น้ำไหล)
+// water_system/history/{yyyy-MM-dd}: {
+//   used_liters: <number>,                         // ยอดรวมของทั้งวัน
+//   hourly/{HH}: { used_liters: <number> },         // ยอดของแต่ละชั่วโมง (00-23)
+// }
+//
+// 🚀 แต่ละ tab ดึงข้อมูลเฉพาะช่วงที่ต้องใช้จริงเท่านั้น (ไม่โหลดทั้ง history ทั้งก้อน)
+// เพื่อประหยัดแบนด์วิดท์ Firebase เมื่อข้อมูลสะสมไปเรื่อยๆ หลายเดือน/ปี:
+//   - "วัน"   -> อ่านแค่ node ของวันนี้/hourly (24 ค่า)
+//   - "เดือน" -> query เฉพาะช่วงวันที่ของเดือนนี้ (orderByKey + startAt/endAt)
+//   - "ปี"    -> query เฉพาะช่วงวันที่ของปีนี้ แล้วรวมเป็นรายเดือนฝั่ง client
 class HistoryPage extends StatefulWidget {
   const HistoryPage({super.key});
 
@@ -13,33 +21,66 @@ class HistoryPage extends StatefulWidget {
 }
 
 class _HistoryScreenState extends State<HistoryPage> {
-  final DatabaseReference _historyRef = FirebaseDatabase.instance.ref(
-    'water_system/history',
-  );
-  StreamSubscription<DatabaseEvent>? _historySubscription;
-
   // ตัวแปรสำหรับเก็บสถานะการเลือก Tab (วัน / เดือน / ปี)
   String _selectedPeriod = 'วัน';
-  bool _isLoading = true;
 
-  // key: 'yyyy-MM-dd' -> ปริมาณน้ำที่ใช้ไปของวันนั้น (ลิตร)
-  Map<String, double> _dailyUsage = {};
+  // key: '00'..'23' -> ปริมาณน้ำที่ใช้ไปของชั่วโมงนั้น (วันนี้)
+  Map<String, double> _hourlyToday = {};
+  // key: 'yyyy-MM-dd' -> ปริมาณน้ำที่ใช้ไปของวันนั้น (เดือนนี้)
+  Map<String, double> _dailyThisMonth = {};
+  // key: 'yyyy-MM-dd' -> ปริมาณน้ำที่ใช้ไปของวันนั้น (ทั้งปีนี้ ไว้รวมเป็นรายเดือน)
+  Map<String, double> _dailyThisYear = {};
+
+  bool _hourlyLoaded = false;
+  bool _monthlyLoaded = false;
+  bool _yearlyLoaded = false;
+  bool get _isLoading => !(_hourlyLoaded && _monthlyLoaded && _yearlyLoaded);
+
+  late final DatabaseReference _hourlyRef;
+  late final Query _monthQuery;
+  late final Query _yearQuery;
+
+  StreamSubscription<DatabaseEvent>? _hourlySub;
+  StreamSubscription<DatabaseEvent>? _monthSub;
+  StreamSubscription<DatabaseEvent>? _yearSub;
 
   static const List<String> _thaiMonths = [
     'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.',
     'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.',
   ];
 
+  static String _pad2(int n) => n.toString().padLeft(2, '0');
+
   @override
   void initState() {
     super.initState();
-    _historySubscription = _historyRef.onValue.listen(
+
+    final now = DateTime.now();
+    final todayKey = '${now.year}-${_pad2(now.month)}-${_pad2(now.day)}';
+    final monthStartKey = '${now.year}-${_pad2(now.month)}-01';
+    final monthEndKey = '${now.year}-${_pad2(now.month)}-31';
+    final yearStartKey = '${now.year}-01-01';
+    final yearEndKey = '${now.year}-12-31';
+
+    _hourlyRef = FirebaseDatabase.instance.ref(
+      'water_system/history/$todayKey/hourly',
+    );
+    _monthQuery = FirebaseDatabase.instance
+        .ref('water_system/history')
+        .orderByKey()
+        .startAt(monthStartKey)
+        .endAt(monthEndKey);
+    _yearQuery = FirebaseDatabase.instance
+        .ref('water_system/history')
+        .orderByKey()
+        .startAt(yearStartKey)
+        .endAt(yearEndKey);
+
+    _hourlySub = _hourlyRef.onValue.listen(
       (event) {
         if (!mounted) return;
-
+        final parsed = <String, double>{};
         final rootValue = event.snapshot.value;
-        final Map<String, double> parsed = {};
-
         if (rootValue != null) {
           try {
             final rootData = Map<dynamic, dynamic>.from(rootValue as Map);
@@ -48,77 +89,105 @@ class _HistoryScreenState extends State<HistoryPage> {
               parsed[key.toString()] = (entry['used_liters'] ?? 0).toDouble();
             });
           } catch (e) {
-            debugPrint('Error parsing Firebase history data: $e');
+            debugPrint('Error parsing Firebase hourly data: $e');
           }
         }
-
         setState(() {
-          _dailyUsage = parsed;
-          _isLoading = false;
+          _hourlyToday = parsed;
+          _hourlyLoaded = true;
         });
       },
       onError: (error) {
-        debugPrint('Firebase history stream error: $error');
-        if (mounted) setState(() => _isLoading = false);
+        debugPrint('Firebase hourly stream error: $error');
+        if (mounted) setState(() => _hourlyLoaded = true);
+      },
+    );
+
+    _monthSub = _monthQuery.onValue.listen(
+      (event) => _handleDailyEvent(event, (parsed) {
+        _dailyThisMonth = parsed;
+        _monthlyLoaded = true;
+      }),
+      onError: (error) {
+        debugPrint('Firebase month stream error: $error');
+        if (mounted) setState(() => _monthlyLoaded = true);
+      },
+    );
+
+    _yearSub = _yearQuery.onValue.listen(
+      (event) => _handleDailyEvent(event, (parsed) {
+        _dailyThisYear = parsed;
+        _yearlyLoaded = true;
+      }),
+      onError: (error) {
+        debugPrint('Firebase year stream error: $error');
+        if (mounted) setState(() => _yearlyLoaded = true);
       },
     );
   }
 
+  // 🔁 ใช้ร่วมกันระหว่าง query เดือน/ปี เพราะ parsing เหมือนกันทุกอย่าง
+  // ต่างกันแค่ map ปลายทางที่จะเก็บผลลัพธ์
+  void _handleDailyEvent(
+    DatabaseEvent event,
+    void Function(Map<String, double> parsed) assignTo,
+  ) {
+    if (!mounted) return;
+    final parsed = <String, double>{};
+    final rootValue = event.snapshot.value;
+    if (rootValue != null) {
+      try {
+        final rootData = Map<dynamic, dynamic>.from(rootValue as Map);
+        rootData.forEach((key, value) {
+          final entry = Map<dynamic, dynamic>.from(value as Map);
+          parsed[key.toString()] = (entry['used_liters'] ?? 0).toDouble();
+        });
+      } catch (e) {
+        debugPrint('Error parsing Firebase daily data: $e');
+      }
+    }
+    setState(() => assignTo(parsed));
+  }
+
   @override
   void dispose() {
-    _historySubscription?.cancel();
+    _hourlySub?.cancel();
+    _monthSub?.cancel();
+    _yearSub?.cancel();
     super.dispose();
   }
 
   // -----------------------------------------------------------------
-  // 🧮 รวมข้อมูลรายวันให้เป็นรายการตามช่วงเวลาที่เลือก (วัน / เดือน / ปี)
-  // เรียงจากเก่าไปใหม่ ใช้ทั้งกราฟและการ์ดสรุป
+  // 🧮 สร้างรายการข้อมูลตาม tab ที่เลือกอยู่ เรียงจากเก่า -> ใหม่
+  //   วัน   -> ครบ 24 ชั่วโมงของวันนี้ (เติม 0 ให้ชั่วโมงที่ยังไม่มีข้อมูล)
+  //   เดือน -> รายวันของเดือนนี้
+  //   ปี    -> รายเดือนของปีนี้ (รวมจากยอดรายวันทั้งปี)
   // -----------------------------------------------------------------
   List<MapEntry<String, double>> _buildAggregatedEntries() {
-    if (_dailyUsage.isEmpty) return [];
-
     switch (_selectedPeriod) {
-      case 'เดือน':
-        return _aggregateBy((date) =>
-            '${date.year}-${date.month.toString().padLeft(2, '0')}')
-            .map((e) => MapEntry(_formatMonthLabel(e.key), e.value))
-            .toList();
       case 'ปี':
-        return _aggregateBy((date) => date.year.toString())
-            .map((e) => MapEntry(e.key, e.value))
+        final totals = <String, double>{};
+        for (final e in _dailyThisYear.entries) {
+          final monthKey = e.key.substring(0, 7); // 'yyyy-MM'
+          totals[monthKey] = (totals[monthKey] ?? 0) + e.value;
+        }
+        final sortedKeys = totals.keys.toList()..sort();
+        return sortedKeys
+            .map((k) => MapEntry(_formatMonthLabel(k), totals[k]!))
+            .toList();
+      case 'เดือน':
+        final entries = _dailyThisMonth.entries.toList()
+          ..sort((a, b) => a.key.compareTo(b.key));
+        return entries
+            .map((e) => MapEntry(e.key.split('-').last, e.value))
             .toList();
       case 'วัน':
       default:
-        final entries = _dailyUsage.entries.toList()
-          ..sort((a, b) => a.key.compareTo(b.key));
-        // แสดงแค่ 30 วันล่าสุด กันกราฟยาวเกินไปเมื่อมีข้อมูลสะสมมาก
-        final recent = entries.length > 30
-            ? entries.sublist(entries.length - 30)
-            : entries;
-        return recent
-            .map((e) => MapEntry(_formatDayLabel(e.key), e.value))
-            .toList();
+        return List.generate(24, (h) {
+          final key = _pad2(h);
+          return MapEntry('$key:00', _hourlyToday[key] ?? 0.0);
+        });
     }
-  }
-
-  List<MapEntry<String, double>> _aggregateBy(
-    String Function(DateTime date) keyOf,
-  ) {
-    final Map<String, double> totals = {};
-    for (final e in _dailyUsage.entries) {
-      final date = DateTime.tryParse(e.key);
-      if (date == null) continue;
-      final key = keyOf(date);
-      totals[key] = (totals[key] ?? 0) + e.value;
-    }
-    final sortedKeys = totals.keys.toList()..sort();
-    return sortedKeys.map((k) => MapEntry(k, totals[k]!)).toList();
-  }
-
-  String _formatDayLabel(String isoDate) {
-    final date = DateTime.tryParse(isoDate);
-    if (date == null) return isoDate;
-    return '${date.day}/${date.month}';
   }
 
   String _formatMonthLabel(String yearMonth) {
@@ -127,9 +196,47 @@ class _HistoryScreenState extends State<HistoryPage> {
     return '${_thaiMonths[month - 1]} ${parts[0]}';
   }
 
+  String get _averageUnitLabel {
+    switch (_selectedPeriod) {
+      case 'วัน':
+        return 'ชั่วโมง';
+      case 'เดือน':
+        return 'วัน';
+      case 'ปี':
+        return 'เดือน';
+      default:
+        return '';
+    }
+  }
+
+  String get _chartTitle {
+    switch (_selectedPeriod) {
+      case 'วัน':
+        return 'การใช้น้ำวันนี้ (รายชั่วโมง)';
+      case 'เดือน':
+        return 'การใช้น้ำเดือนนี้ (รายวัน)';
+      case 'ปี':
+        return 'การใช้น้ำปีนี้ (รายเดือน)';
+      default:
+        return '';
+    }
+  }
+
+  String get _detailSectionTitle {
+    switch (_selectedPeriod) {
+      case 'วัน':
+        return 'รายละเอียดรายชั่วโมง (วันนี้)';
+      case 'เดือน':
+        return 'รายละเอียดรายวัน (เดือนนี้)';
+      case 'ปี':
+        return 'รายละเอียดรายเดือน (ปีนี้)';
+      default:
+        return '';
+    }
+  }
+
   double get _totalForPeriod {
-    final entries = _buildAggregatedEntries();
-    return entries.fold(0.0, (sum, e) => sum + e.value);
+    return _buildAggregatedEntries().fold(0.0, (sum, e) => sum + e.value);
   }
 
   double get _averageForPeriod {
@@ -249,7 +356,7 @@ class _HistoryScreenState extends State<HistoryPage> {
         const SizedBox(width: 12),
         Expanded(
           child: _buildCardItem(
-            title: 'เฉลี่ยต่อ$_selectedPeriod',
+            title: 'เฉลี่ยต่อ$_averageUnitLabel',
             value: '${_averageForPeriod.toStringAsFixed(1)} ลิตร',
             icon: Icons.analytics,
             color: Colors.orange,
@@ -323,6 +430,7 @@ class _HistoryScreenState extends State<HistoryPage> {
   // -----------------------------------------------------------------
   Widget _buildChartSection() {
     final entries = _buildAggregatedEntries();
+    final hasData = entries.any((e) => e.value > 0);
 
     return Container(
       height: 220,
@@ -344,7 +452,7 @@ class _HistoryScreenState extends State<HistoryPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'กราฟแสดงสถิติการใช้น้ำ (ราย$_selectedPeriod)',
+            _chartTitle,
             style: const TextStyle(
               fontWeight: FontWeight.bold,
               fontSize: 16,
@@ -352,7 +460,7 @@ class _HistoryScreenState extends State<HistoryPage> {
             ),
           ),
           Expanded(
-            child: entries.isEmpty
+            child: !hasData
                 ? const Center(
                     child: Text(
                       'ยังไม่มีข้อมูลการใช้น้ำ\nรอเชื่อมต่อเซ็นเซอร์วัดการไหล',
@@ -425,9 +533,14 @@ class _HistoryScreenState extends State<HistoryPage> {
   // 📋 4. รายการประวัติแบบละเอียด (History List)
   // -----------------------------------------------------------------
   Widget _buildHistoryList() {
-    final entries = _dailyUsage.entries.toList()
-      ..sort((a, b) => b.key.compareTo(a.key)); // ใหม่ -> เก่า
-    final recent = entries.length > 10 ? entries.sublist(0, 10) : entries;
+    List<MapEntry<String, double>> entries = _buildAggregatedEntries();
+    if (_selectedPeriod == 'วัน') {
+      // ตัดชั่วโมงในอนาคตของวันนี้ทิ้ง (ยังไม่เกิดขึ้นจริง ไม่มีความหมายในลิสต์)
+      final currentHour = DateTime.now().hour;
+      entries = entries.sublist(0, currentHour + 1);
+    }
+    entries = entries.reversed.toList(); // ใหม่ -> เก่า
+    final recent = entries.length > 12 ? entries.sublist(0, 12) : entries;
 
     return Container(
       padding: const EdgeInsets.all(20),
@@ -447,16 +560,16 @@ class _HistoryScreenState extends State<HistoryPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'ประวัติการใช้งานล่าสุด',
-            style: TextStyle(
+          Text(
+            _detailSectionTitle,
+            style: const TextStyle(
               fontWeight: FontWeight.bold,
               fontSize: 16,
               color: Colors.black87,
             ),
           ),
           const SizedBox(height: 12),
-          if (recent.isEmpty)
+          if (recent.every((e) => e.value == 0))
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 12),
               child: Text(
@@ -470,10 +583,6 @@ class _HistoryScreenState extends State<HistoryPage> {
               physics: const NeverScrollableScrollPhysics(),
               itemCount: recent.length,
               itemBuilder: (context, index) {
-                final date = DateTime.tryParse(recent[index].key);
-                final label = date == null
-                    ? recent[index].key
-                    : '${date.day} ${_thaiMonths[date.month - 1]} ${date.year}';
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 6.0),
                   child: ListTile(
@@ -487,7 +596,7 @@ class _HistoryScreenState extends State<HistoryPage> {
                       child: const Icon(Icons.water, color: Colors.blue),
                     ),
                     title: Text(
-                      label,
+                      recent[index].key,
                       style: const TextStyle(
                         fontWeight: FontWeight.w600,
                         fontSize: 14,

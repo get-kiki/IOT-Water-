@@ -89,9 +89,15 @@ class _ActivityPageState extends State<ActivityPage> {
     'water_system/activities',
   );
   StreamSubscription<DatabaseEvent>? _subscription;
+  // 🚀 เช็กซ้ำเป็นระยะเผื่อผู้ใช้เปิดแอปค้างข้ามเที่ยงคืน (onValue จะไม่ยิงเองถ้าไม่มีข้อมูลเปลี่ยน)
+  Timer? _purgeTimer;
 
   bool _isLoading = true;
   List<_ActivityLog> _logs = [];
+
+  // 📆 กิจกรรมเป็นแบบรายวัน แสดงผลแค่ของ "วันนี้" เท่านั้น
+  List<_ActivityLog> get _todayLogs =>
+      _logs.where((log) => _isToday(log.timestamp)).toList();
 
   @override
   void initState() {
@@ -130,18 +136,36 @@ class _ActivityPageState extends State<ActivityPage> {
           _logs = parsed;
           _isLoading = false;
         });
+
+        _purgeStaleActivities();
       },
       onError: (error) {
         debugPrint('Firebase activities stream error: $error');
         if (mounted) setState(() => _isLoading = false);
       },
     );
+
+    _purgeTimer = Timer.periodic(
+      const Duration(minutes: 5),
+      (_) => _purgeStaleActivities(),
+    );
   }
 
   @override
   void dispose() {
     _subscription?.cancel();
+    _purgeTimer?.cancel();
     super.dispose();
+  }
+
+  // 🗑️ ลบกิจกรรมที่ไม่ใช่ของวันนี้ออกจาก Firebase จริง (ข้ามวันแล้วให้หายไปเลย)
+  void _purgeStaleActivities() {
+    final stale = _logs.where((log) => !_isToday(log.timestamp));
+    for (final log in stale) {
+      _activitiesRef.child(log.id).remove().catchError((e) {
+        debugPrint('Error removing stale activity ${log.id}: $e');
+      });
+    }
   }
 
   bool _isToday(int millis) {
@@ -154,9 +178,7 @@ class _ActivityPageState extends State<ActivityPage> {
   }
 
   double get _todayTotal {
-    return _logs
-        .where((log) => _isToday(log.timestamp))
-        .fold(0.0, (sum, log) => sum + log.liters);
+    return _todayLogs.fold(0.0, (sum, log) => sum + log.liters);
   }
 
   Future<void> _openAddActivitySheet() async {
@@ -196,7 +218,7 @@ class _ActivityPageState extends State<ActivityPage> {
               _buildAddButton(),
               const SizedBox(height: 20),
               const Text(
-                'กิจกรรมล่าสุด',
+                'กิจกรรมวันนี้',
                 style: TextStyle(
                   fontWeight: FontWeight.bold,
                   fontSize: 16,
@@ -204,10 +226,10 @@ class _ActivityPageState extends State<ActivityPage> {
                 ),
               ),
               const SizedBox(height: 12),
-              if (_logs.isEmpty)
+              if (_todayLogs.isEmpty)
                 _buildEmptyState()
               else
-                ..._logs.map(_buildActivityCard),
+                ..._todayLogs.map(_buildActivityCard),
             ],
           ),
         ),
@@ -304,7 +326,7 @@ class _ActivityPageState extends State<ActivityPage> {
           Icon(Icons.event_note, size: 40, color: Colors.grey.shade400),
           const SizedBox(height: 12),
           Text(
-            'ยังไม่มีกิจกรรม กดปุ่ม "เพิ่มกิจกรรม" เพื่อเริ่มบันทึก',
+            'วันนี้ยังไม่มีกิจกรรม กดปุ่ม "เพิ่มกิจกรรม" เพื่อเริ่มบันทึก',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
           ),
@@ -313,11 +335,64 @@ class _ActivityPageState extends State<ActivityPage> {
     );
   }
 
+  // 🗑️ ถามยืนยันก่อนลบกิจกรรม กันปัดพลาดแล้วข้อมูลหาย
+  Future<bool> _confirmDeleteActivity(_ActivityLog log) async {
+    final type = _typeById(log.typeId);
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('ลบกิจกรรมนี้?'),
+        content: Text(
+          '${type.label} • ${log.liters.toStringAsFixed(0)} ลิตร\n'
+          '${_formatTime(log.timestamp)}',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('ยกเลิก'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('ลบ', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
+  Future<void> _deleteActivity(_ActivityLog log) async {
+    try {
+      await _activitiesRef.child(log.id).remove();
+    } catch (e) {
+      debugPrint('Error deleting activity ${log.id}: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ลบไม่สำเร็จ กรุณาลองใหม่')),
+        );
+      }
+    }
+  }
+
   Widget _buildActivityCard(_ActivityLog log) {
     final type = _typeById(log.typeId);
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Container(
+      child: Dismissible(
+        key: ValueKey(log.id),
+        direction: DismissDirection.endToStart,
+        confirmDismiss: (_) => _confirmDeleteActivity(log),
+        onDismissed: (_) => _deleteActivity(log),
+        background: Container(
+          alignment: Alignment.centerRight,
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          decoration: BoxDecoration(
+            color: Colors.red.shade400,
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: const Icon(Icons.delete, color: Colors.white),
+        ),
+        child: Container(
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
           color: Colors.white,
@@ -373,6 +448,7 @@ class _ActivityPageState extends State<ActivityPage> {
               ),
             ),
           ],
+        ),
         ),
       ),
     );

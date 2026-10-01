@@ -1,0 +1,244 @@
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <Preferences.h>
+#include <time.h>
+
+// --- ตั้งค่า Wi-Fi และ Firebase (ใช้ระบบ Firebase เดียวกับบอร์ดอื่น) ---
+#define WIFI_SSID "Yiwa F4"
+#define WIFI_PASSWORD "Bang4567"
+#define FIREBASE_HOST "water-tank-iot-8c113-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "qKEAYzn9dc31GnN38eAaHFtmUWcIxyilFFh43beN"
+
+#define FLOW_SENSOR_PIN 27  // 🚀 ขา Signal ของ YF-S201 Flow Sensor ฝั่ง "ขาออก" (เปลี่ยนได้ถ้าต่อสายขาอื่น)
+
+// YF-S201: ความถี่พัลส์ (Hz) = 7.5 * อัตราการไหล (L/min)  =>  450 พัลส์ ต่อ 1 ลิตร
+#define FLOW_CALIBRATION_FACTOR 450.0
+
+#define GMT_OFFSET_SEC (7 * 3600)  // ประเทศไทย UTC+7
+#define NTP_SERVER "pool.ntp.org"
+
+FirebaseData firebaseData;
+FirebaseConfig config;
+FirebaseAuth auth;
+Preferences prefs;  // เก็บยอดสะสมของวันนี้ไว้ใน flash กันหายตอนไฟดับ/รีสตาร์ทกลางวัน
+
+// 🚀 ตัวนับพัลส์จาก Flow Sensor อัปเดตใน ISR จึงต้องเป็น volatile
+volatile unsigned long flowPulseCount = 0;
+
+float  currentFlowRate = 0.0;   // L/min เรียลไทม์ (อัตราการไหลขณะนี้)
+String flowStatus      = "NO FLOW";
+
+float  dailyLiters     = 0.0;   // ยอดน้ำที่ใช้ไปสะสมของ "วันนี้"
+String currentDateKey  = "";    // รูปแบบ yyyy-MM-dd ตรงกับ schema ที่ history.dart คาดหวัง
+
+float  hourlyLiters    = 0.0;   // ยอดน้ำที่ใช้ไปสะสมของ "ชั่วโมงนี้"
+int    currentHour     = -1;    // 0-23, -1 = ยังไม่เคย sync เวลาสำเร็จ
+
+unsigned long lastFlowCheckTime   = 0;
+unsigned long lastPrefsSaveTime   = 0;
+unsigned long lastHistoryPushTime = 0;
+
+const unsigned long FLOW_CHECK_INTERVAL   = 1000;  // คำนวณอัตราการไหล + เช็กวันใหม่ทุก 1 วินาที
+const unsigned long PREFS_SAVE_INTERVAL   = 30000; // เซฟยอดสะสมลง flash ทุก 30 วินาที กันแฟลชสึกจากการเขียนถี่เกินไป
+const unsigned long HISTORY_PUSH_INTERVAL = 2000;  // อัปเดตยอดวันนี้ขึ้น Firebase ห่างกันอย่างน้อย 2 วินาที
+
+void IRAM_ATTR onFlowPulse() {
+  flowPulseCount++;
+}
+
+// -------------------------------------------------------
+// คืนค่าวันที่ปัจจุบันรูปแบบ yyyy-MM-dd จากเวลาที่ sync มาจาก NTP
+// คืนค่าว่างถ้ายังไม่เคย sync เวลาสำเร็จ (กันเขียนคีย์วันที่ผิดตอนบูต)
+String getTodayDateKey() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 2000)) {
+    return "";
+  }
+  char buf[11];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+           timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+  return String(buf);
+}
+
+// -------------------------------------------------------
+// คืนค่าชั่วโมงปัจจุบัน (0-23) จากเวลาที่ sync มาจาก NTP, คืน -1 ถ้ายังไม่เคย sync สำเร็จ
+int getCurrentHour() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 2000)) {
+    return -1;
+  }
+  return timeinfo.tm_hour;
+}
+
+// แปลงเลขชั่วโมง (0-23) เป็นคีย์ 2 หลักสำหรับ path บน Firebase เช่น 5 -> "05"
+String hourKeyStr(int hour) {
+  char buf[3];
+  snprintf(buf, sizeof(buf), "%02d", hour);
+  return String(buf);
+}
+
+// -------------------------------------------------------
+void loadTodayFromStorage() {
+  String savedDate       = prefs.getString("date", "");
+  float  savedLiters     = prefs.getFloat("liters", 0.0);
+  int    savedHour       = prefs.getInt("hour", -1);
+  float  savedHourLiters = prefs.getFloat("hliters", 0.0);
+
+  String today   = getTodayDateKey();
+  int    nowHour = getCurrentHour();
+
+  if (today != "" && today == savedDate) {
+    // ยังเป็นวันเดิมกับตอนปิดเครื่อง กู้ยอดสะสมคืนมาต่อ
+    currentDateKey = savedDate;
+    dailyLiters    = savedLiters;
+    Serial.printf("[Storage] กู้ยอดวันนี้คืน: %.2f ลิตร (%s)\n", dailyLiters, currentDateKey.c_str());
+  } else if (today != "") {
+    // ข้ามวันไปแล้วตอนที่ปิดเครื่องอยู่ (หรือเปิดเครื่องครั้งแรก) เริ่มวันใหม่จาก 0
+    currentDateKey = today;
+    dailyLiters    = 0.0;
+  }
+
+  if (nowHour != -1 && today == savedDate && nowHour == savedHour) {
+    // ยังเป็นชั่วโมงเดิมกับตอนปิดเครื่อง กู้ยอดสะสมคืนมาต่อ
+    currentHour  = savedHour;
+    hourlyLiters = savedHourLiters;
+    Serial.printf("[Storage] กู้ยอดชั่วโมงคืน: %.2f ลิตร (%02d:00)\n", hourlyLiters, currentHour);
+  } else if (nowHour != -1) {
+    // ข้ามชั่วโมงไปแล้ว (หรือเปิดเครื่องครั้งแรก) เริ่มชั่วโมงใหม่จาก 0
+    currentHour  = nowHour;
+    hourlyLiters = 0.0;
+  }
+}
+
+void saveTodayToStorage() {
+  prefs.putString("date", currentDateKey);
+  prefs.putFloat("liters", dailyLiters);
+  prefs.putInt("hour", currentHour);
+  prefs.putFloat("hliters", hourlyLiters);
+}
+
+// -------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  prefs.begin("flowlog", false);
+
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onFlowPulse, FALLING);
+
+  // เชื่อม Wi-Fi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int wifiCounter = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiCounter < 20) {
+    delay(500);
+    Serial.print(".");
+    wifiCounter++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    config.host = FIREBASE_HOST;
+    config.signer.tokens.legacy_token = FIREBASE_AUTH;
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+
+    configTime(GMT_OFFSET_SEC, 0, NTP_SERVER);  // ซิงก์เวลาไทยไว้ตัดสินวันที่สำหรับ history
+
+    Serial.println("\n=================================");
+    Serial.println("Flow Sensor (ขาออก) ออนไลน์สำเร็จ!");
+    Serial.println("=================================");
+  } else {
+    Serial.println("\nเชื่อม Wi-Fi ไม่สำเร็จ");
+  }
+
+  loadTodayFromStorage();
+
+  lastFlowCheckTime   = millis();
+  lastPrefsSaveTime   = millis();
+  lastHistoryPushTime = millis();
+}
+
+// -------------------------------------------------------
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+  }
+
+  // ---- คำนวณอัตราการไหลจริงจาก Flow Sensor ทุก 1 วินาที ----
+  if (millis() - lastFlowCheckTime >= FLOW_CHECK_INTERVAL) {
+    unsigned long elapsedMs = millis() - lastFlowCheckTime;
+
+    noInterrupts();
+    unsigned long pulses = flowPulseCount;
+    flowPulseCount = 0;
+    interrupts();
+
+    float litersThisWindow = pulses / FLOW_CALIBRATION_FACTOR;
+    currentFlowRate = litersThisWindow * (60000.0 / elapsedMs);
+    flowStatus = (currentFlowRate > 0.5) ? "FLOW" : "NO FLOW"; // > 0.5 L/min กันสัญญาณรบกวนเล็กน้อย
+    lastFlowCheckTime = millis();
+
+    // ---- เช็กว่าข้ามชั่วโมง/วันใหม่หรือยัง (ยึดตามเวลาจริงจาก NTP) ----
+    String today   = getTodayDateKey();
+    int    nowHour = getCurrentHour();
+
+    // ปิดยอดของชั่วโมงที่เพิ่งจบก่อนเปลี่ยนคีย์วันที่ กันกรณีชนกันพอดีตอนเที่ยงคืน
+    // (ชั่วโมง 23 ต้องถูกบันทึกเข้าวันเก่า ไม่ใช่วันใหม่)
+    if (nowHour != -1 && currentHour != -1 && nowHour != currentHour) {
+      if (WiFi.status() == WL_CONNECTED) {
+        String hourPath = "/water_system/history/" + currentDateKey +
+                           "/hourly/" + hourKeyStr(currentHour) + "/used_liters";
+        Firebase.setFloat(firebaseData, hourPath.c_str(), hourlyLiters);
+      }
+      Serial.printf("[Hour Rollover] ปิดยอดชั่วโมง %02d:00 = %.2f ลิตร\n", currentHour, hourlyLiters);
+    }
+
+    if (today != "" && today != currentDateKey) {
+      currentDateKey = today;
+      dailyLiters    = 0.0;
+      saveTodayToStorage();
+      Serial.printf("[Day Rollover] เริ่มนับยอดวันใหม่: %s\n", currentDateKey.c_str());
+    }
+
+    if (nowHour != -1 && nowHour != currentHour) {
+      currentHour  = nowHour;
+      hourlyLiters = 0.0;
+      saveTodayToStorage();
+    }
+
+    // ---- สะสมยอดน้ำที่ใช้ไปของวันนี้ + ชั่วโมงนี้ ----
+    if (litersThisWindow > 0 && currentDateKey != "") {
+      dailyLiters += litersThisWindow;
+      if (currentHour != -1) {
+        hourlyLiters += litersThisWindow;
+      }
+    }
+
+    Serial.printf("[Flow] %.2f L/min (%s) | วันนี้ใช้ไป %.2f ลิตร\n",
+                  currentFlowRate, flowStatus.c_str(), dailyLiters);
+
+    if (WiFi.status() == WL_CONNECTED) {
+      // 🚀 บอร์ดนี้มีหน้าที่แค่บันทึกประวัติการใช้น้ำรายวัน ไม่เขียน flow_rate_min
+      // (flow_rate_min เป็นหน้าที่ของบอร์ด flow sensor ขาเข้าเท่านั้น)
+
+      // ส่งยอดสะสมของวันนี้ + ชั่วโมงนี้ขึ้น Firebase เฉพาะตอนมีน้ำไหลจริง และห่างกันอย่างน้อย HISTORY_PUSH_INTERVAL
+      // path ตรงกับ schema ที่ history.dart อ่านอยู่:
+      //   water_system/history/{yyyy-MM-dd}/used_liters
+      //   water_system/history/{yyyy-MM-dd}/hourly/{HH}/used_liters
+      if (litersThisWindow > 0 && currentDateKey != "" &&
+          millis() - lastHistoryPushTime >= HISTORY_PUSH_INTERVAL) {
+        String basePath = "/water_system/history/" + currentDateKey;
+        Firebase.setFloat(firebaseData, (basePath + "/used_liters").c_str(), dailyLiters);
+        if (currentHour != -1) {
+          String hourPath = basePath + "/hourly/" + hourKeyStr(currentHour) + "/used_liters";
+          Firebase.setFloat(firebaseData, hourPath.c_str(), hourlyLiters);
+        }
+        lastHistoryPushTime = millis();
+      }
+    }
+  }
+
+  // ---- เซฟยอดสะสมลง flash เป็นระยะ กันข้อมูลหายตอนไฟดับ/รีสตาร์ทกลางวัน ----
+  if (millis() - lastPrefsSaveTime >= PREFS_SAVE_INTERVAL) {
+    saveTodayToStorage();
+    lastPrefsSaveTime = millis();
+  }
+}
