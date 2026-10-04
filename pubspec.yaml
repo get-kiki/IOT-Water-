@@ -38,6 +38,9 @@ dependencies:
   firebase_core: ^3.1.1
   firebase_database: ^11.0.3
 
+  # 🌐 ใช้เรียก Gemini REST API (https://generativelanguage.googleapis.com)
+  http: ^1.6.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
