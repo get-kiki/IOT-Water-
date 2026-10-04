@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# 🔐 ไฟล์เก็บค่า dart-define (API Key ฯลฯ) ห้าม commit ขึ้น git เด็ดขาด
+env.json
+*.dart_define.json
