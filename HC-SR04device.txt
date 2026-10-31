@@ -241,9 +241,12 @@ void updateWaterLevel() {
   if (filteredDistance < 0) filteredDistance = median;
   else                      filteredDistance += EMA_ALPHA * (median - filteredDistance);
 
-  // ความสูงน้ำ = ระยะตอนว่าง - ระยะตอนนี้ (จำกัดไม่เกินระดับเต็ม)
+  // ความสูงน้ำ = ระยะตอนว่าง - ระยะตอนนี้
+  // *** ไม่ตัดเพดานที่ระดับเต็มก่อนเฉลี่ย ***
+  // เดิมตัดที่ usableDepth() ตรงนี้ -> ระยะ < 4 ซม. ดันค่าเฉลี่ยขึ้นไม่ได้ แต่ระยะ > 4 ซม. ดึงลงได้
+  // -> ค้าง 98.x% ตอนเซนเซอร์แกว่ง ตอนนี้ปล่อยให้เกินได้ (สูงสุด TANK_DEPTH) แล้วไปตัดที่ % แทน
   float h = TANK_DEPTH - median;
-  h = constrain(h, 0.0f, usableDepth());
+  h = constrain(h, 0.0f, TANK_DEPTH);
 
   // EMA: ค่อยๆ ขยับเข้าหาค่าใหม่ ไม่กระโดด
   if (filteredHeight < 0) filteredHeight = h;
@@ -305,7 +308,7 @@ void drawWaterTank(int x, int y, int w, int h, int percent) {
   display.drawRect(x + 2, y - 2, w - 4, 2, SSD1306_WHITE);
   display.drawRect(x - 2, y + 4, 2, 2, SSD1306_WHITE);
   display.drawRect(x + w, y + 4, 2, 2, SSD1306_WHITE);
-  int maxWaterHeight = h - 6;
+  int maxWaterHeight = h - 4;     // เต็มขอบในพอดี (เดิม h - 6 ตอน 100% ยังเห็นช่องว่างด้านบน)
   int fillH = maxWaterHeight * percent / 100;
   if (fillH > 0) {
     display.fillRect(x + 2, y + (h - 2) - fillH, w - 4, fillH, SSD1306_WHITE);
@@ -441,7 +444,7 @@ void loop() {
         lastSentLiters = liters;
         lastSendTime   = millis();
         // ส่งความสูงของน้ำ (ซม. จากก้นถัง) ไปพร้อมกัน
-        float heightCm = round(filteredHeight * 10.0) / 10.0;
+        float heightCm = round(min(filteredHeight, usableDepth()) * 10.0) / 10.0;  // ไม่เกินระดับเต็ม
         if (!Firebase.setFloat(firebaseData, "/water_system/monitor/water_height_cm", heightCm)) {
           Serial.println("ส่ง water_height_cm ล้มเหลว: " + firebaseData.errorReason());
         }
