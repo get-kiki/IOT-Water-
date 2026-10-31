@@ -1,12 +1,33 @@
+/* ============================================================
+   Water Tank IoT - ESP32 + YF-S201 Flow Sensor ฝั่ง "ขาเข้า"
+   WiFi: จัดการด้วย WiFiManager (tzapu)
+   โหมดใช้งานจริง (TEST_PORTAL ปิดอยู่)
+   บอร์ดจะต่อ WiFi เดิมที่เคยตั้งไว้อัตโนมัติเมื่อบูต ถ้าต่อไม่ติดค่อยเปิดหน้า
+   ตั้งค่าให้เอง ถ้าจะทดสอบเปลี่ยน WiFi ให้ไปเปิดบรรทัด #define TEST_PORTAL
+   ด้านล่างใหม่ (เอา // ออก) แล้วอย่าลืมปิดกลับก่อนใช้งานจริงอีกครั้ง
+
+   - หน้าที่เดียว: วัดอัตราการไหล "ขาเข้า" แล้วส่งขึ้น
+     /water_system/monitor/flow_rate_min
+   - ปุ่ม BOOT กดค้าง 3 วิ = ล้างค่า WiFi ที่จำไว้ แล้วรีสตาร์ทเข้าโหมดตั้งค่า
+   - ต่อ WiFi ไม่ติดก็ทำงานต่อแบบ offline (ยังนับพัลส์/คำนวณอัตราการไหล)
+     แล้วเริ่มส่งขึ้น Firebase เองเมื่อเน็ตกลับมา ไม่ต้องรีสตาร์ท
+   ============================================================ */
 #include <WiFi.h>
-#include <WiFiManager.h>      // 🚀 เพิ่มไลบรารี WiFiManager
+#include <WiFiManager.h>          // ติดตั้ง "WiFiManager" by tzapu
 #include <FirebaseESP32.h>
-
-// --- ตั้งค่า Firebase ---
-#define FIREBASE_HOST "water-tank-iot-8c113-default-rtdb.asia-southeast1.firebasedatabase.app"
-#define FIREBASE_AUTH "qKEAYzn9dc31GnN38eAaHFtmUWcIxyilFFh43beN"
-
-#define FLOW_SENSOR_PIN 27  // ขา Signal ของ YF-S201 Flow Sensor
+// ---------- โหมดทดสอบ ----------
+// #define TEST_PORTAL             // <<< ปิดแล้ว (โหมดใช้งานจริง) เปิดใหม่ได้ถ้าต้องทดสอบ WiFi
+// ---------- Firebase ----------
+#define FIREBASE_HOST "water-tank-iot-e8d2e-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "2FlCqgXyhK1dq48gdOOXIoln7WCQLY3swZat0Oge"
+// ---------- WiFiManager ----------
+#define AP_NAME            "FlowSensorIn-Setup"  // ชื่อ WiFi ที่บอร์ดปล่อยตอนตั้งค่า
+#define AP_PASSWORD        "12345678"            // รหัสเข้า AP (ต้อง >= 8 ตัว)
+#define PORTAL_TIMEOUT_SEC 180                   // ไม่มีใครตั้งค่าใน 3 นาที -> ทำงานต่อ
+#define CONNECT_TIMEOUT_SEC 20                   // รอต่อ WiFi เดิม 20 วิ
+// ---------- ขา ----------
+#define FLOW_SENSOR_PIN 27   // ขา Signal ของ YF-S201 Flow Sensor
+#define BUTTON_PIN      0    // ปุ่ม BOOT: กดค้าง 3 วิ = ล้างค่า WiFi
 
 // YF-S201: ความถี่พัลส์ (Hz) = 7.5 * อัตราการไหล (L/min)  =>  450 พัลส์ ต่อ 1 ลิตร
 #define FLOW_CALIBRATION_FACTOR 450.0
@@ -14,61 +35,120 @@
 FirebaseData firebaseData;
 FirebaseConfig config;
 FirebaseAuth auth;
+bool firebaseReady = false;
 
+// ตัวนับพัลส์จาก Flow Sensor อัปเดตใน ISR จึงต้องเป็น volatile
 volatile unsigned long flowPulseCount = 0;
-float currentFlowRate = 0.0;
-String flowStatus = "NO FLOW";
+float  currentFlowRate = 0.0;
+String flowStatus      = "NO FLOW";
 
 unsigned long lastFlowCheckTime = 0;
-const unsigned long FLOW_CHECK_INTERVAL = 1000; // คำนวณทุก 1 วินาที
+unsigned long lastWifiCheckTime = 0;
+const unsigned long FLOW_CHECK_INTERVAL = 1000;   // คำนวณอัตราการไหลทุก 1 วินาที
+const unsigned long WIFI_CHECK_INTERVAL = 10000;  // เฝ้าดู WiFi ทุก 10 วินาที
+// ปุ่มกดค้างเพื่อล้าง WiFi
+const unsigned long RESET_HOLD_MS = 3000;         // อยากให้กดนานขึ้นก็เพิ่มเลขนี้
+unsigned long buttonHoldStart = 0;
+bool buttonWasDown = false;
 
 void IRAM_ATTR onFlowPulse() {
   flowPulseCount++;
 }
-
+// -------------------------------------------------------
+// WiFiManager เรียกอัตโนมัติเมื่อเข้าโหมดตั้งค่า
+void configModeCallback(WiFiManager *myWiFiManager) {
+  Serial.println("[WiFi] เข้าโหมดตั้งค่า - ต่อมือถือเข้า " AP_NAME);
+  Serial.println("[WiFi] แล้วเปิดเบราว์เซอร์ไปที่ 192.168.4.1");
+}
+// -------------------------------------------------------
+// เริ่ม Firebase (เรียกซ้ำได้ ทำงานจริงครั้งเดียว)
+// แยกออกมาเพื่อให้บอร์ดที่บูตมาแบบ offline ยัง init ได้เมื่อเน็ตกลับมาทีหลัง
+void initFirebase() {
+  if (firebaseReady) return;
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Firebase.setFloatDigits(2);   // อัตราการไหลใช้ทศนิยม 2 ตำแหน่ง
+  firebaseReady = true;
+  Serial.println("=================================");
+  Serial.println("Flow Sensor (ขาเข้า) ออนไลน์สำเร็จ!");
+  Serial.print("SSID: "); Serial.println(WiFi.SSID());
+  Serial.print("IP  : "); Serial.println(WiFi.localIP());
+  Serial.println("=================================");
+}
+// -------------------------------------------------------
+// กดปุ่ม BOOT ค้าง 3 วิ = ลืมรหัส WiFi แล้วรีสตาร์ทเข้าโหมดตั้งค่า
+void handleWiFiResetButton() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    if (!buttonWasDown) {
+      buttonWasDown   = true;
+      buttonHoldStart = millis();
+    } else if (millis() - buttonHoldStart >= RESET_HOLD_MS) {
+      Serial.println("[WiFi] ล้างค่า WiFi ที่บันทึกไว้...");
+      WiFiManager wm;
+      wm.resetSettings();
+      delay(1000);
+      ESP.restart();
+    }
+  } else {
+    buttonWasDown = false;
+  }
+}
 // -------------------------------------------------------
 void setup() {
   Serial.begin(115200);
 
   pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onFlowPulse, FALLING);
 
-  // 🚀 --- เริ่มระบบ WiFiManager ---
+  // ---- เชื่อม WiFi ด้วย WiFiManager ----
   WiFiManager wm;
-  
-  // (เลือกได้) รีเซ็ตค่า Wi-Fi เดิมที่เคยจำไว้เพื่อทดสอบระบบ
-  // wm.resetSettings(); 
-
-  Serial.println("กำลังเชื่อมต่อ Wi-Fi หรือเปิด AP Mode...");
-  
-  // สร้าง Access Point ชื่อ "FlowSensor_Setup" รหัสผ่าน "12345678" 
-  // หากเชื่อม Wi-Fi เก่าไม่ได้ บอร์ดจะปล่อย Wi-Fi ชื่อนี้ออกมา
-  bool res = wm.autoConnect("FlowSensor_Setup", "12345678");
-
-  if (!res) {
-    Serial.println("เชื่อมต่อ Wi-Fi ไม่สำเร็จ และหมดเวลาในการตั้งค่า");
-    ESP.restart(); // รีสตาร์ทตัวเองเพื่อลองใหม่
+  wm.setAPCallback(configModeCallback);
+  wm.setConfigPortalTimeout(PORTAL_TIMEOUT_SEC);
+  wm.setConnectTimeout(CONNECT_TIMEOUT_SEC);
+  wm.setTitle("Water Tank IoT - Flow In");
+  bool ok;
+#ifdef TEST_PORTAL
+  // โหมดทดสอบ: เปิดหน้าตั้งค่าทันทีทุกครั้ง ไม่สนรหัสเก่า
+  // (ไม่ลบรหัสเก่าทิ้ง - ถ้าเปลี่ยนใจ กด Exit ในหน้าเว็บได้)
+  Serial.println("[TEST] TEST_PORTAL เปิดอยู่ - บังคับเข้าหน้าตั้งค่า");
+  ok = wm.startConfigPortal(AP_NAME, AP_PASSWORD);
+#else
+  // โหมดใช้งานจริง: มีรหัสเก่า -> ต่อเลย / ไม่มีหรือต่อไม่ติด -> เปิด portal
+  Serial.println("[WiFi] กำลังต่อ WiFi เดิมที่เคยตั้งไว้...");
+  ok = wm.autoConnect(AP_NAME, AP_PASSWORD);
+#endif
+  if (ok) {
+    initFirebase();
+  } else {
+    Serial.println("[WiFi] ต่อไม่สำเร็จ - ทำงานแบบ offline (ยังนับพัลส์อยู่)");
+    Serial.println("[WiFi] กดปุ่ม BOOT ค้าง 3 วิ เพื่อตั้งค่า WiFi ใหม่");
   }
-
-  // หากโค้ดทำงานมาถึงตรงนี้ แปลว่าเชื่อมต่อ Wi-Fi ได้แล้ว
-  Serial.println("\nเชื่อมต่อ Wi-Fi สำเร็จแล้ว!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  // --- เชื่อมต่อ Firebase ---
-  config.host = FIREBASE_HOST;
-  config.signer.tokens.legacy_token = FIREBASE_AUTH;
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-  Serial.println("\n=================================");
-  Serial.println("Flow Sensor Board ออนไลน์สำเร็จ!");
-  Serial.println("=================================");
+  WiFi.setAutoReconnect(true);
 
   lastFlowCheckTime = millis();
+  lastWifiCheckTime = millis();
 }
-
 // -------------------------------------------------------
 void loop() {
+  // กดปุ่ม BOOT ค้าง 3 วิ = เปลี่ยน WiFi ใหม่
+  handleWiFiResetButton();
+
+  // ---- เฝ้าดู WiFi ทุก 10 วินาที ----
+  if (millis() - lastWifiCheckTime >= WIFI_CHECK_INTERVAL) {
+    lastWifiCheckTime = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WiFi] หลุด - กำลังต่อใหม่...");
+      WiFi.reconnect();
+    } else {
+      initFirebase();   // เผื่อบูตมาแบบ offline แล้วเพิ่งต่อติดทีหลัง
+    }
+  }
+  bool online = (WiFi.status() == WL_CONNECTED) && firebaseReady;
+
+  // ---- คำนวณอัตราการไหลจริงจาก Flow Sensor ทุก 1 วินาที ----
   if (millis() - lastFlowCheckTime >= FLOW_CHECK_INTERVAL) {
     unsigned long elapsedMs = millis() - lastFlowCheckTime;
 
@@ -78,16 +158,19 @@ void loop() {
     interrupts();
 
     currentFlowRate = (pulses / FLOW_CALIBRATION_FACTOR) * (60000.0 / elapsedMs);
-    flowStatus = (currentFlowRate > 0.5) ? "FLOW" : "NO FLOW"; 
+    flowStatus = (currentFlowRate > 0.5) ? "FLOW" : "NO FLOW"; // > 0.5 L/min กันสัญญาณรบกวนเล็กน้อย
     lastFlowCheckTime = millis();
 
-    Serial.printf("[Flow] %.2f L/min (%s)\n", currentFlowRate, flowStatus.c_str());
+    Serial.printf("[Flow] %.2f L/min (%s)%s\n",
+                  currentFlowRate, flowStatus.c_str(), online ? "" : "  [offline]");
 
-    // ส่งค่าขึ้น Firebase ถ้ายังต่อ Wi-Fi อยู่
-    if (WiFi.status() == WL_CONNECTED) {
-      Firebase.setFloat(firebaseData, "/water_system/monitor/flow_rate_min", currentFlowRate);
-    } else {
-      Serial.println("Wi-Fi ขาดการเชื่อมต่อ...");
+    // ส่งค่าขึ้น Firebase ถ้าออนไลน์อยู่
+    if (online) {
+      if (!Firebase.setFloat(firebaseData, "/water_system/monitor/flow_rate_min", currentFlowRate)) {
+        Serial.println("ส่ง flow_rate_min ล้มเหลว: " + firebaseData.errorReason());
+      }
     }
   }
+
+  delay(10);   // ไม่ให้ลูปหมุนเปล่า ๆ (ไม่กระทบการนับพัลส์ เพราะนับใน ISR)
 }

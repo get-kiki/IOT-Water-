@@ -539,8 +539,18 @@ class _HistoryScreenState extends State<HistoryPage> {
       final currentHour = DateTime.now().hour;
       entries = entries.sublist(0, currentHour + 1);
     }
-    entries = entries.reversed.toList(); // ใหม่ -> เก่า
-    final recent = entries.length > 12 ? entries.sublist(0, 12) : entries;
+    // 🔎 เรียงใหม่ -> เก่า แล้วแสดงเฉพาะช่วงที่ "มีการใช้น้ำจริง"
+    //
+    //    🐛 บั๊กเดิม: ตัดเหลือ 12 แถวล่าสุด (entries.sublist(0, 12))
+    //    ทำให้ชั่วโมง 00:00 หลุดจากลิสต์ทันทีที่เวลาผ่านเที่ยงวันไปแล้ว
+    //    (17:00 → ลิสต์เหลือแค่ 17:00 ลงมาถึง 06:00) ทั้งที่ข้อมูลอยู่ใน
+    //    Firebase ครบ และกราฟแท่งด้านบนก็แสดง 24 ชั่วโมงเต็มอยู่แล้ว
+    //    ผู้ใช้จึงเข้าใจผิดว่าระบบไม่บันทึกการใช้น้ำตอนกลางคืน
+    //
+    //    ตอนนี้กรอง "ชั่วโมงที่ใช้น้ำ 0 ลิตร" ออกแทนการตัดตามจำนวนแถว
+    //    → ไม่มีข้อมูลที่มีค่าถูกซ่อนอีก และลิสต์สั้นลงกว่าเดิมด้วย
+    //      เพราะวันหนึ่งมักมีเพียงไม่กี่ชั่วโมงที่ใช้น้ำจริง
+    final recent = entries.reversed.where((e) => e.value > 0).toList();
 
     return Container(
       padding: const EdgeInsets.all(20),
@@ -569,7 +579,8 @@ class _HistoryScreenState extends State<HistoryPage> {
             ),
           ),
           const SizedBox(height: 12),
-          if (recent.every((e) => e.value == 0))
+          // ว่าง = ไม่มีช่วงไหนใช้น้ำเลย (recent ถูกกรองให้เหลือค่า > 0 แล้ว)
+          if (recent.isEmpty)
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 12),
               child: Text(

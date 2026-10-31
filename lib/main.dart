@@ -27,7 +27,260 @@ class MyApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'ขนาดแทงค์น้ำ'),
+      home: const _StartupGate(),
+    );
+  }
+}
+
+// =====================================================================
+// 🚪 _StartupGate — ตัวตัดสินใจว่าเปิดแอปแล้วควรไปหน้าไหน
+//
+//    เดิมแอปตั้งหน้า "เลือกขนาดแทงค์น้ำ" เป็นหน้าแรกแบบตายตัว ผู้ใช้จึงต้อง
+//    กรอกขนาดถังใหม่ทุกครั้งที่เปิดแอป ทั้งที่ค่าถูกเก็บไว้ใน Firebase แล้ว
+//
+//    ตอนนี้จะอ่าน water_system/setting ครั้งเดียวก่อน แล้วเลือกเส้นทาง
+//      • มีค่าที่ใช้ได้     → เข้าหน้าปริมาณน้ำในแทงค์ (WaterTankPage) เลย
+//      • อ่านได้แต่ไม่มีค่า → หน้าเลือกขนาดแทงค์น้ำ (ตั้งค่าครั้งแรก)
+//      • อ่านไม่ได้         → หน้าแจ้งข้อผิดพลาด + ปุ่มลองใหม่
+//
+//    ⚠️ จุดสำคัญ: ต้องแยก "อ่านได้แต่ไม่มีค่า" ออกจาก "อ่านไม่ได้" ให้ชัด
+//    ถ้าเน็ตล่มแล้วเหมารวมว่า "ยังไม่ตั้งค่า" ผู้ใช้จะถูกพาไปกรอกใหม่
+//    แล้วอาจเขียนทับค่าความลึกที่บอร์ด ESP32 วัดเองไว้ถูกต้องแล้ว
+//    (ปุ่ม BOOT บนบอร์ดเขียน setting/tank_depth กลับขึ้นมาได้)
+// =====================================================================
+
+/// 🔢 ช่วงค่าที่ยอมรับ — ต้องตรงกับ MIN_/MAX_ ใน HC-SR04device.txt
+///    (ถ้าแก้ที่นี่ ต้องไปแก้ที่ firmware ให้ตรงกันด้วย)
+const double kMinTankCapacity = 2.0; // ลิตร
+const double kMaxTankCapacity = 10000.0; // ลิตร
+const double kMinTankDepth = 6.0; // ซม.
+const double kMaxTankDepth = 500.0; // ซม.
+
+/// 🔎 แปลงค่าจาก Firebase เป็น double (ทนค่าผิดประเภท/ค่าที่หายไป)
+double? _settingDouble(dynamic value) {
+  if (value is num) return value.toDouble();
+  if (value is String) return double.tryParse(value);
+  return null;
+}
+
+/// ✅ ข้อมูลขนาดถังใน Firebase ใช้งานได้แล้วหรือยัง
+///    ต้องมีทั้งความจุและความลึก และอยู่ในช่วงที่บอร์ดยอมรับ
+bool isTankConfigured(dynamic settingValue) {
+  if (settingValue is! Map) return false;
+  final data = Map<dynamic, dynamic>.from(settingValue);
+
+  final double? capacity = _settingDouble(data['tank_capacity']);
+  final double? depth = _settingDouble(data['tank_depth']);
+  if (capacity == null || depth == null) return false;
+
+  return capacity >= kMinTankCapacity &&
+      capacity <= kMaxTankCapacity &&
+      depth >= kMinTankDepth &&
+      depth <= kMaxTankDepth;
+}
+
+enum _GateStatus { loading, configured, needsSetup, error }
+
+class _StartupGate extends StatefulWidget {
+  const _StartupGate();
+
+  @override
+  State<_StartupGate> createState() => _StartupGateState();
+}
+
+class _StartupGateState extends State<_StartupGate> {
+  _GateStatus _status = _GateStatus.loading;
+
+  @override
+  void initState() {
+    super.initState();
+    _check();
+  }
+
+  Future<void> _check() async {
+    if (mounted) setState(() => _status = _GateStatus.loading);
+    try {
+      final event = await FirebaseDatabase.instance
+          .ref('water_system/setting')
+          .once()
+          .timeout(const Duration(seconds: 20));
+      if (!mounted) return;
+      setState(() {
+        _status = isTankConfigured(event.snapshot.value)
+            ? _GateStatus.configured
+            : _GateStatus.needsSetup;
+      });
+    } catch (e) {
+      // ⚠️ อ่านไม่ได้ ≠ ยังไม่ตั้งค่า — ห้ามพาไปหน้ากรอกค่าใหม่
+      debugPrint('อ่านขนาดถังจาก Firebase ไม่สำเร็จ: $e');
+      if (!mounted) return;
+      setState(() => _status = _GateStatus.error);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    switch (_status) {
+      case _GateStatus.configured:
+        return const WaterTankPage();
+      case _GateStatus.needsSetup:
+        return const MyHomePage(title: 'ขนาดแทงค์น้ำ');
+      case _GateStatus.loading:
+        return const _SplashScreen();
+      case _GateStatus.error:
+        return _GateErrorScreen(onRetry: _check);
+    }
+  }
+}
+
+/// ⏳ หน้ารอระหว่างอ่านค่าตั้งต้นจาก Firebase
+class _SplashScreen extends StatelessWidget {
+  const _SplashScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFEAF3FB),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Container(
+              width: 76,
+              height: 76,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: <Color>[Colors.blue.shade300, Colors.blue.shade600],
+                ),
+                boxShadow: <BoxShadow>[
+                  BoxShadow(
+                    color: Colors.blue.withValues(alpha: 0.35),
+                    blurRadius: 18,
+                    offset: const Offset(0, 8),
+                  ),
+                ],
+              ),
+              child: const Icon(
+                Icons.water_drop,
+                color: Colors.white,
+                size: 38,
+              ),
+            ),
+            const SizedBox(height: 22),
+            const Text(
+              'Water Tank IoT',
+              style: TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFF1F2937),
+              ),
+            ),
+            const SizedBox(height: 18),
+            const SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2.4),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'กำลังโหลดข้อมูลแทงค์น้ำ...',
+              style: TextStyle(fontSize: 12.5, color: Colors.grey.shade600),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// ❌ หน้าแจ้งว่าอ่านค่าจาก Firebase ไม่ได้ (เน็ตล่ม / สิทธิ์ไม่พอ)
+class _GateErrorScreen extends StatelessWidget {
+  final Future<void> Function() onRetry;
+
+  const _GateErrorScreen({required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFEAF3FB),
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: <Widget>[
+                  Icon(
+                    Icons.cloud_off_rounded,
+                    size: 56,
+                    color: Colors.grey.shade400,
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'เชื่อมต่อฐานข้อมูลไม่สำเร็จ',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF1F2937),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'ไม่สามารถอ่านข้อมูลขนาดแทงค์น้ำได้\n'
+                    'กรุณาตรวจสอบอินเทอร์เน็ตแล้วลองใหม่อีกครั้ง',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 13,
+                      height: 1.5,
+                      color: Colors.grey.shade600,
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  SizedBox(
+                    height: 48,
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blue,
+                        foregroundColor: Colors.white,
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      onPressed: onRetry,
+                      icon: const Icon(Icons.refresh_rounded),
+                      label: const Text(
+                        'ลองใหม่',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 15,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  // 🚪 ทางออกสำรอง เผื่ออ่านไม่ได้จริง ๆ แต่ผู้ใช้อยากตั้งค่าเอง
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pushReplacement(
+                      MaterialPageRoute<void>(
+                        builder: (_) =>
+                            const MyHomePage(title: 'ขนาดแทงค์น้ำ'),
+                      ),
+                    ),
+                    child: const Text('ตั้งค่าขนาดแทงค์น้ำเอง'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -243,6 +496,26 @@ class _MyHomePageState extends State<MyHomePage> {
 
     if (parsedDepth == null || parsedCapacity == null) {
       _showSnackBar('กรุณากรอกข้อมูลเป็นตัวเลขที่ถูกต้อง');
+      return;
+    }
+
+    // 🚧 ตรวจช่วงค่าด้วยเกณฑ์เดียวกับ isTankConfigured() และ firmware
+    //    ถ้าไม่ตรวจที่นี่ ผู้ใช้จะบันทึกค่านอกช่วงลง Firebase ได้ แล้ว
+    //    _StartupGate จะอ่านแล้วตีความว่า "ยังไม่ตั้งค่า" → เด้งกลับมาหน้านี้
+    //    ทุกครั้งที่เปิดแอปแบบวนลูปโดยที่ผู้ใช้ไม่เข้าใจว่าทำอะไรผิด
+    if (parsedCapacity < kMinTankCapacity ||
+        parsedCapacity > kMaxTankCapacity) {
+      _showSnackBar(
+        'ความจุต้องอยู่ระหว่าง ${kMinTankCapacity.toStringAsFixed(0)}'
+        '-${kMaxTankCapacity.toStringAsFixed(0)} ลิตร',
+      );
+      return;
+    }
+    if (parsedDepth < kMinTankDepth || parsedDepth > kMaxTankDepth) {
+      _showSnackBar(
+        'ความสูงต้องอยู่ระหว่าง ${kMinTankDepth.toStringAsFixed(0)}'
+        '-${kMaxTankDepth.toStringAsFixed(0)} ซม.',
+      );
       return;
     }
 

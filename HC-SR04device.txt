@@ -9,7 +9,20 @@
    - รองรับความจุถัง 2 - 10,000 ลิตร (แก้ช่วงได้ที่ MIN_/MAX_CAPACITY)
    - อ่านระดับน้ำแบบกรอง 3 ชั้น: มัธยฐาน 7 ค่า -> EMA -> easing animation
    - ไม่มีการตรวจการไหลในบอร์ดนี้แล้ว (ใช้บอร์ด flow sensor แยก)
+   - ส่งความสูงของน้ำ (ซม.) ขึ้น /water_system/monitor/water_height_cm
+   - ปุ่ม BOOT กดสั้น (ตอนถังว่าง) = วัดความลึกถังอัตโนมัติ แล้วส่งขึ้น
+     /water_system/setting/tank_depth / กดค้าง 3 วิ = ล้าง WiFi
+   - ส่งระยะจากเซนเซอร์ถึงผิวน้ำ/ก้นถัง ณ ตอนนั้น ขึ้น
+     /water_system/monitor/distance_cm ตลอด (ถังว่าง = ความลึกถัง)
    - เวอร์ชัน "ทศนิยม": แสดง/ส่งลิตรเป็นทศนิยม 1 ตำแหน่ง (เหมาะกับขวด/ถังเล็ก)
+
+   การคำนวณระดับน้ำ (แบบ 2 จุด ไม่ใช้ SAFE_ZONE แล้ว):
+     TANK_DEPTH  = ระยะเซนเซอร์ -> ก้นถัง (ตอนถังว่าง)  กดปุ่ม BOOT วัดได้ / ตั้งจากแอปได้
+     FULL_DIST   = ระยะเซนเซอร์ -> ผิวน้ำ (ตอนถังเต็ม) = 4 ซม.
+     ช่วงใช้งาน   = TANK_DEPTH - FULL_DIST
+     ความสูงน้ำ   = TANK_DEPTH - ระยะที่วัดได้           (จำกัด 0 ถึง ช่วงใช้งาน)
+     ระดับน้ำ %   = ความสูงน้ำ / ช่วงใช้งาน x 100
+     ปริมาณน้ำ    = % / 100 x TANK_CAPACITY
    ============================================================ */
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -21,8 +34,8 @@
 // ---------- โหมดทดสอบ ----------
 // #define TEST_PORTAL             // <<< ปิดแล้ว (โหมดใช้งานจริง) เปิดใหม่ได้ถ้าต้องทดสอบ WiFi
 // ---------- Firebase ----------
-#define FIREBASE_HOST "water-tank-iot-8c113-default-rtdb.asia-southeast1.firebasedatabase.app"
-#define FIREBASE_AUTH "qKEAYzn9dc31GnN38eAaHFtmUWcIxyilFFh43beN"
+#define FIREBASE_HOST "water-tank-iot-e8d2e-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "2FlCqgXyhK1dq48gdOOXIoln7WCQLY3swZat0Oge"
 // ---------- WiFiManager ----------
 #define AP_NAME            "WaterTank-Setup"   // ชื่อ WiFi ที่บอร์ดปล่อยตอนตั้งค่า
 #define AP_PASSWORD        "12345678"          // รหัสเข้า AP (ต้อง >= 8 ตัว)
@@ -36,12 +49,12 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // ---------- ขา ----------
 #define TRIG_PIN   25
 #define ECHO_PIN   18
-#define BUTTON_PIN 0     // ปุ่ม BOOT: กดค้าง 3 วิ = ล้างค่า WiFi
+#define BUTTON_PIN 0     // ปุ่ม BOOT: กดสั้น = วัดความลึกถังว่าง / กดค้าง 3 วิ = ล้างค่า WiFi
 #define EEPROM_SIZE 8    // float 2 ตัว x 4 bytes
 // ---------- ช่วงค่าที่ยอมรับ ----------
 #define MIN_CAPACITY  2.0      // ลิตร
 #define MAX_CAPACITY  10000.0  // ลิตร
-#define MIN_DEPTH     3.0      // ซม.
+#define MIN_DEPTH     6.0      // ซม. (ต้องมากกว่า FULL_DIST)
 #define MAX_DEPTH     500.0    // ซม.
 // ---------- การกรองค่าเซนเซอร์ ----------
 #define SAMPLE_COUNT   7       // จำนวนค่าที่ใช้หามัธยฐาน (เลขคี่)
@@ -53,9 +66,16 @@ FirebaseData firebaseData;
 FirebaseConfig config;
 FirebaseAuth auth;
 bool firebaseReady = false;
-float TANK_DEPTH    = 114.0;
-float TANK_CAPACITY = 400.0;
-const float SAFE_ZONE = 2.5;
+float TANK_DEPTH    = 114.0;   // ระยะจากเซนเซอร์ถึงก้นถังตอนว่าง (ค่าดิบ ไม่หักอะไร)
+float TANK_CAPACITY = 400.0;   // ความจุตอนน้ำเต็ม (ลิตร)
+
+// ระยะเซนเซอร์ -> ผิวน้ำ ตอนถังเต็ม (ซม.) = จุด 100%
+const float FULL_DIST = 4.0;
+
+// น้ำใกล้เต็มแล้วเซนเซอร์อ่านไม่ได้ (ผิวน้ำเข้าใกล้จุดบอด HC-SR04)
+// ถ้า % ล่าสุด >= NEAR_FULL_PERCENT และอ่านพลาดติดกัน FULL_FAIL_COUNT ครั้ง -> ถือว่าเต็ม
+const float NEAR_FULL_PERCENT = 95.0;
+const int   FULL_FAIL_COUNT   = 10;     // 10 ครั้ง x 100 ms = 1 วิ
 
 // ค่าระดับน้ำ
 float samples[SAMPLE_COUNT];
@@ -63,6 +83,10 @@ int   sampleIdx    = 0;
 int   sampleFilled = 0;
 int   sensorFailCount = 0;
 float filteredHeight  = -1;    // -1 = ยังไม่มีค่า
+float filteredDistance = -1;   // ระยะเซนเซอร์ -> ผิวน้ำ (ซม.) ที่กรองแล้ว / -1 = ยังไม่มีค่า
+float lastSentDistance = -1;
+unsigned long lastDistanceSendTime = 0;
+unsigned long lastDistanceCheck    = 0;
 float rawWaterPercent = 0.0;   // เป้าหมายที่ผ่านการกรองแล้ว
 float smoothPercent   = 0.0;   // ค่าที่ใช้วาดบนจอ (ค่อยๆ วิ่งเข้าหา rawWaterPercent)
 
@@ -83,6 +107,14 @@ const unsigned long WIFI_CHECK_INTERVAL     = 10000;
 const unsigned long RESET_HOLD_MS = 3000;      // อยากให้กดนานขึ้นก็เพิ่มเลขนี้
 unsigned long buttonHoldStart = 0;
 bool buttonWasDown = false;
+const unsigned long SHORT_PRESS_MAX_MS = 1000; // กดแล้วปล่อยภายใน 1 วิ = วัดความลึก
+bool depthUploadPending = false;               // วัดความลึกแล้ว แต่ยังไม่ได้ส่งขึ้น Firebase
+// -------------------------------------------------------
+// ช่วงที่น้ำขึ้นลงได้จริง (ก้นถัง -> ระดับเต็ม)
+float usableDepth() {
+  float u = TANK_DEPTH - FULL_DIST;
+  return (u < 1.0f) ? 1.0f : u;    // กันหารด้วย 0 / ค่าติดลบ
+}
 // -------------------------------------------------------
 // แสดงข้อความ 3 บรรทัดบน OLED
 void showMessage(String l1, String l2, String l3) {
@@ -117,7 +149,10 @@ void initFirebase() {
   Serial.println("=================================");
 }
 // -------------------------------------------------------
-// กดปุ่ม BOOT ค้าง 3 วิ = ลืมรหัส WiFi แล้วรีสตาร์ทเข้าโหมดตั้งค่า
+// ปุ่ม BOOT:
+//   กดแล้วปล่อยภายใน 1 วิ -> วัดความลึกถังว่าง (calibrateEmptyDepth)
+//   กดค้าง 3 วิ          -> ลืมรหัส WiFi แล้วรีสตาร์ทเข้าโหมดตั้งค่า
+void calibrateEmptyDepth();   // ประกาศไว้ก่อน (ตัวจริงอยู่ด้านล่าง)
 void handleWiFiResetButton() {
   if (digitalRead(BUTTON_PIN) == LOW) {
     if (!buttonWasDown) {
@@ -132,6 +167,12 @@ void handleWiFiResetButton() {
       ESP.restart();
     }
   } else {
+    if (buttonWasDown) {
+      unsigned long held = millis() - buttonHoldStart;
+      if (held >= 50 && held <= SHORT_PRESS_MAX_MS) {   // >= 50ms กันสัญญาณเด้ง
+        calibrateEmptyDepth();
+      }
+    }
     buttonWasDown = false;
   }
 }
@@ -165,6 +206,7 @@ void resetFilter() {
   sampleIdx      = 0;
   sampleFilled   = 0;
   filteredHeight = -1;
+  filteredDistance = -1;
 }
 // -------------------------------------------------------
 // อ่านเซนเซอร์ 1 ครั้ง แล้วอัปเดตค่าระดับน้ำที่กรองแล้ว
@@ -172,8 +214,16 @@ void updateWaterLevel() {
   float d = readUltrasonic();
 
   // ตัดค่าที่เป็นไปไม่ได้ (อ่านพลาด / ไกลเกินก้นถัง)
-  if (d <= 0 || d > TANK_DEPTH + SAFE_ZONE + 20) {
+  if (d <= 0 || d > MAX_DEPTH) {
     sensorFailCount++;
+
+    // น้ำเกือบเต็มแล้วอ่านไม่ได้ = ผิวน้ำเข้าใกล้จุดบอดเซนเซอร์ -> ถือว่าเต็ม
+    if (sensorFailCount >= FULL_FAIL_COUNT && filteredHeight >= 0 &&
+        rawWaterPercent >= NEAR_FULL_PERCENT) {
+      filteredHeight  = usableDepth();
+      rawWaterPercent = 100.0;
+    }
+
     if (sensorFailCount == 20) {   // พลาดติดกัน ~2 วิ ค่อยแจ้ง จะได้ไม่รก Serial
       Serial.println("[Sensor] อ่านค่า HC-SR04 ไม่สำเร็จต่อเนื่อง - ใช้ค่าล่าสุดไปก่อน");
     }
@@ -186,16 +236,68 @@ void updateWaterLevel() {
   if (sampleFilled < SAMPLE_COUNT) sampleFilled++;
   if (sampleFilled < 3) return;    // รอให้มีข้อมูลพอก่อน
 
-  float effectiveDistance = getMedian() - SAFE_ZONE;
-  if (effectiveDistance < 0) effectiveDistance = 0;
-  float h = TANK_DEPTH - effectiveDistance;
-  h = constrain(h, 0.0f, TANK_DEPTH);
+  float median = getMedian();
+  // ระยะจริงจากเซนเซอร์ (ไม่ตัดด้วยความลึกถัง) - ไว้ส่งขึ้น Firebase
+  if (filteredDistance < 0) filteredDistance = median;
+  else                      filteredDistance += EMA_ALPHA * (median - filteredDistance);
+
+  // ความสูงน้ำ = ระยะตอนว่าง - ระยะตอนนี้ (จำกัดไม่เกินระดับเต็ม)
+  float h = TANK_DEPTH - median;
+  h = constrain(h, 0.0f, usableDepth());
 
   // EMA: ค่อยๆ ขยับเข้าหาค่าใหม่ ไม่กระโดด
   if (filteredHeight < 0) filteredHeight = h;
   else                    filteredHeight += EMA_ALPHA * (h - filteredHeight);
 
-  rawWaterPercent = filteredHeight / TANK_DEPTH * 100.0;
+  // % เทียบกับช่วงที่น้ำขึ้นลงได้จริง (TANK_DEPTH - FULL_DIST)
+  rawWaterPercent = constrain(filteredHeight / usableDepth() * 100.0f, 0.0f, 100.0f);
+}
+// -------------------------------------------------------
+// วัดความลึกถังตอน "ว่าง" (ไม่มีน้ำ): อ่านหลายครั้ง เอาค่ามัธยฐาน
+// แล้วตั้งเป็น TANK_DEPTH + บันทึก EEPROM + ส่งขึ้น Firebase
+void calibrateEmptyDepth() {
+  Serial.println("[CAL] เริ่มวัดความลึกถังว่าง...");
+  showMessage("CALIBRATE", "measuring empty", "please wait...");
+
+  const int N = 15;
+  float vals[N];
+  int n = 0;
+  for (int i = 0; i < N; i++) {
+    float d = readUltrasonic();
+    if (d > 0) vals[n++] = d;
+    delay(60);                       // HC-SR04 ควรเว้นอย่างน้อย ~60 ms ต่อครั้ง
+  }
+  if (n < 5) {
+    Serial.println("[CAL] อ่านค่าไม่ได้ - เช็คสาย/ตำแหน่งเซนเซอร์");
+    showMessage("CALIBRATE FAIL", "no echo", "");
+    delay(2000);
+    return;
+  }
+  for (int i = 1; i < n; i++) {      // insertion sort
+    float k = vals[i]; int j = i - 1;
+    while (j >= 0 && vals[j] > k) { vals[j + 1] = vals[j]; j--; }
+    vals[j + 1] = k;
+  }
+  // ใช้ระยะที่วัดได้ตรงๆ = ระยะเซนเซอร์ -> ก้นถัง (ไม่หักอะไร)
+  float depth = round(vals[n / 2] * 10.0) / 10.0;
+
+  if (depth < MIN_DEPTH || depth > MAX_DEPTH) {
+    Serial.printf("[CAL] ค่า %.1f ซม. อยู่นอกช่วง %.0f-%.0f\n", depth, MIN_DEPTH, MAX_DEPTH);
+    showMessage("CALIBRATE FAIL", "out of range", String(depth, 1) + " cm");
+    delay(2000);
+    return;
+  }
+
+  TANK_DEPTH = depth;
+  EEPROM.put(0, TANK_DEPTH);
+  EEPROM.commit();
+  resetFilter();
+  lastSentLiters     = -1;            // บังคับส่งระดับน้ำใหม่
+  depthUploadPending = true;          // ส่ง tank_depth ขึ้น Firebase ในรอบถัดไป
+  Serial.printf("[CAL] ความลึกถังว่าง = %.1f ซม. / ช่วงใช้งาน = %.1f ซม.\n", TANK_DEPTH, usableDepth());
+  showMessage("CALIBRATE OK", "depth = " + String(TANK_DEPTH, 1) + " cm",
+              "full at " + String(FULL_DIST, 1) + " cm");
+  delay(2000);
 }
 // -------------------------------------------------------
 void drawWaterTank(int x, int y, int w, int h, int percent) {
@@ -277,8 +379,21 @@ void loop() {
   }
   bool online = (WiFi.status() == WL_CONNECTED) && firebaseReady;
 
+  // ---- ส่งความลึกที่วัดจากปุ่มขึ้น Firebase (ต้องส่งก่อนอ่าน ไม่งั้นค่าเก่าจากแอปจะทับ) ----
+  if (online && depthUploadPending) {
+    if (Firebase.setFloat(firebaseData, "/water_system/setting/tank_depth", TANK_DEPTH)) {
+      depthUploadPending = false;
+      Serial.printf("[CAL] ส่ง tank_depth = %.1f ซม. ขึ้น Firebase แล้ว\n", TANK_DEPTH);
+    } else {
+      Serial.println("[CAL] ส่ง tank_depth ล้มเหลว: " + firebaseData.errorReason());
+    }
+  }
+
   // ---- อ่าน tank_depth / tank_capacity จาก Firebase ----
-  if (online && millis() - lastFirebaseCheckTime >= FIREBASE_CHECK_INTERVAL) {
+  // tank_depth = ระยะเซนเซอร์ -> ก้นถัง ตอนถังว่าง
+  if (online && !depthUploadPending && millis() - lastFirebaseCheckTime >= FIREBASE_CHECK_INTERVAL) {
+    lastFirebaseCheckTime = millis();
+
     bool depthOk   = Firebase.getFloat(firebaseData, "/water_system/setting/tank_depth");
     float newDepth = depthOk ? firebaseData.floatData() : -1;
     bool capOk     = Firebase.getFloat(firebaseData, "/water_system/setting/tank_capacity");
@@ -316,7 +431,8 @@ void loop() {
   // ---- ส่งระดับน้ำขึ้น Firebase: เฉพาะตอนค่าเปลี่ยน หรือครบ 30 วิ ----
   if (online && filteredHeight >= 0 && millis() - lastUploadTime >= UPLOAD_INTERVAL) {
     lastUploadTime = millis();
-    float liters = round(filteredHeight / TANK_DEPTH * TANK_CAPACITY * 10.0) / 10.0;  // ทศนิยม 1 ตำแหน่ง
+    // ลิตร = % / 100 x ความจุ (ทศนิยม 1 ตำแหน่ง)
+    float liters = round(rawWaterPercent / 100.0 * TANK_CAPACITY * 10.0) / 10.0;
     // ส่งเมื่อค่าเปลี่ยนเกินเกณฑ์: อย่างน้อย 0.1 ลิตร หรือ 0.2% ของความจุ (ถังใหญ่จะได้ไม่ส่งถี่เกิน)
     float sendThreshold = max(0.1f, TANK_CAPACITY * 0.002f);
     if (lastSentLiters < 0 || fabs(liters - lastSentLiters) >= sendThreshold ||
@@ -324,8 +440,29 @@ void loop() {
       if (Firebase.setFloat(firebaseData, "/water_system/monitor/water_level_liters", liters)) {
         lastSentLiters = liters;
         lastSendTime   = millis();
+        // ส่งความสูงของน้ำ (ซม. จากก้นถัง) ไปพร้อมกัน
+        float heightCm = round(filteredHeight * 10.0) / 10.0;
+        if (!Firebase.setFloat(firebaseData, "/water_system/monitor/water_height_cm", heightCm)) {
+          Serial.println("ส่ง water_height_cm ล้มเหลว: " + firebaseData.errorReason());
+        }
       } else {
         Serial.println("ส่ง water_level_liters ล้มเหลว: " + firebaseData.errorReason());
+      }
+    }
+  }
+
+  // ---- ส่งระยะเซนเซอร์ (ความลึก ณ ตอนนั้น) ขึ้น Firebase ----
+  // เช็คทุก 2 วิ: ส่งเมื่อเปลี่ยน >= 0.3 ซม. หรือครบ 30 วิ
+  if (online && filteredDistance >= 0 && millis() - lastDistanceCheck >= 2000) {
+    lastDistanceCheck = millis();
+    float distCm = round(filteredDistance * 10.0) / 10.0;
+    if (lastSentDistance < 0 || fabs(distCm - lastSentDistance) >= 0.3 ||
+        millis() - lastDistanceSendTime >= FORCE_SEND_INTERVAL) {
+      if (Firebase.setFloat(firebaseData, "/water_system/monitor/distance_cm", distCm)) {
+        lastSentDistance     = distCm;
+        lastDistanceSendTime = millis();
+      } else {
+        Serial.println("ส่ง distance_cm ล้มเหลว: " + firebaseData.errorReason());
       }
     }
   }

@@ -248,10 +248,14 @@ void main() {
 
       final stopped = TankAlertWatcher.flowAlertFor('none', 'flowing', s);
       expect(stopped!.title, 'น้ำหยุดไหล');
+      // 🔴 น้ำหยุดไหลขณะถังยังไม่เต็ม = วิกฤต (น้ำประปาหยุด/ปั๊มไม่ทำงาน)
+      expect(stopped.type, 'critical');
 
       final resumed = TankAlertWatcher.flowAlertFor('flowing', 'none', s);
       expect(resumed!.title, 'น้ำกลับมาไหล');
       expect(resumed.message, contains('2.5 ลิตร/นาที'));
+      // 🟢 น้ำกลับมาไหล = ข่าวดี ยังเป็น info
+      expect(resumed.type, 'info');
 
       // ไหลอยู่แล้วแล้วเปลี่ยนความเร็ว → ไม่ต้องแจ้ง
       expect(TankAlertWatcher.flowAlertFor('flowing', 'flowing', s), isNull);
@@ -339,7 +343,303 @@ void main() {
       expect(kWarningPercent, 50.0);
       expect(kNormalPercent, 75.0);
       expect(kHighFlowLpm, 30.0);
+      expect(kFullPercent, 99.0);
       expect(kAlertCooldown.inMinutes, 15);
+    });
+  });
+
+  // ==================================================================
+  // ⏳ เทสต์ cooldown ที่ "แยกตามระดับความรุนแรง"
+  //    บั๊กเดิม: cooldown ใช้คีย์เป็นชื่อรางเฉย ๆ ('level') ทำให้การแจ้ง info
+  //    ไปบล็อกการแจ้ง critical ที่ตามมาภายใน 15 นาที → พลาดการแจ้งที่สำคัญสุด
+  // ==================================================================
+  group('TankAlertWatcher cooldown แยกตามระดับความรุนแรง', () {
+    const int t0 = 1767000000000; // เวลาอ้างอิง (ms)
+    const int oneMinute = 60 * 1000;
+
+    test('cooldownKeyOf แยกคีย์ตามราง + ระดับ', () {
+      expect(TankAlertWatcher.cooldownKeyOf('level', 'critical'), 'level:critical');
+      expect(TankAlertWatcher.cooldownKeyOf('level', 'info'), 'level:info');
+      expect(TankAlertWatcher.cooldownKeyOf('flow', 'info'), 'flow:info');
+      // คีย์ของแต่ละระดับต้องไม่ชนกัน
+      expect(
+        TankAlertWatcher.cooldownKeyOf('level', 'info'),
+        isNot(TankAlertWatcher.cooldownKeyOf('level', 'critical')),
+      );
+    });
+
+    test('ไม่เคยแจ้งเลย → แจ้งได้ทันที', () {
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: <String, int>{},
+          track: 'level',
+          type: 'critical',
+          nowMs: t0,
+        ),
+        isTrue,
+      );
+    });
+
+    test('🐛 บั๊กเดิม: แจ้ง info ไปแล้ว 7 นาที → critical ต้องยังแจ้งได้', () {
+      final lastEmitAt = <String, int>{'level:info': t0};
+      final int now = t0 + 7 * oneMinute;
+
+      // info เองยังติด cooldown อยู่ (ถูกต้อง — กันสแปมระดับเดียวกัน)
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'level',
+          type: 'info',
+          nowMs: now,
+        ),
+        isFalse,
+      );
+
+      // แต่ critical ต้องไม่ถูกบล็อก ← จุดที่เคยเป็นบั๊ก
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'level',
+          type: 'critical',
+          nowMs: now,
+        ),
+        isTrue,
+      );
+      // warning ก็ไม่ถูกบล็อกเช่นกัน
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'level',
+          type: 'warning',
+          nowMs: now,
+        ),
+        isTrue,
+      );
+    });
+
+    test('ระดับเดียวกันยังกันซ้ำตามปกติ (ครบ 15 นาทีแล้วแจ้งได้)', () {
+      final lastEmitAt = <String, int>{'level:critical': t0};
+
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'level',
+          type: 'critical',
+          nowMs: t0 + 14 * oneMinute,
+        ),
+        isFalse,
+      );
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'level',
+          type: 'critical',
+          nowMs: t0 + 15 * oneMinute,
+        ),
+        isTrue,
+      );
+    });
+
+    test('ราง flow ไม่มี cooldown → แจ้งได้ทันทีทุกครั้งที่สถานะเปลี่ยน', () {
+      expect(TankAlertWatcher.cooldownForTrack('flow'), Duration.zero);
+      expect(TankAlertWatcher.cooldownForTrack('level'), kAlertCooldown);
+      expect(TankAlertWatcher.cooldownForTrack('full'), kAlertCooldown);
+
+      // เพิ่งแจ้งไปเมื่อ 1 วินาทีที่แล้ว → ราง flow ต้องยังแจ้งได้
+      final lastEmitAt = <String, int>{'flow:info': t0};
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'flow',
+          type: 'info',
+          nowMs: t0 + 1000,
+        ),
+        isTrue,
+      );
+      // แจ้งซ้ำในมิลลิวินาทีเดียวกันก็ยังได้ (ไม่มีหน้าต่างเวลาเลย)
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'flow',
+          type: 'info',
+          nowMs: t0,
+        ),
+        isTrue,
+      );
+      // นาฬิกาเครื่องคลาดจนเวลาติดลบ ก็ยังต้องแจ้งได้ (ลัดวงจรก่อนคำนวณ)
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'flow',
+          type: 'info',
+          nowMs: t0 - 60000,
+        ),
+        isTrue,
+      );
+      // ราง level ที่เวลาเดียวกันต้องยังถูกกันอยู่ (ไม่กระทบกัน)
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: <String, int>{'level:info': t0},
+          track: 'level',
+          type: 'info',
+          nowMs: t0 + 1000,
+        ),
+        isFalse,
+      );
+    });
+
+    test('ไหล-หยุด-ไหล-หยุด รัว ๆ → แจ้งได้ครบทุกครั้ง (ไม่ถูกยุบ)', () {
+      final lastEmitAt = <String, int>{};
+      int emitted = 0;
+      // สลับสถานะทุก 10 วินาที 6 ครั้ง
+      for (int i = 0; i < 6; i++) {
+        final int now = t0 + i * 10000;
+        if (TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'flow',
+          type: 'info',
+          nowMs: now,
+        )) {
+          lastEmitAt[TankAlertWatcher.cooldownKeyOf('flow', 'info')] = now;
+          emitted++;
+        }
+      }
+      expect(emitted, 6); // ครบทุกครั้ง (เดิมจะได้แค่ 1 ใบ)
+    });
+
+    test('รางต่างกันไม่กวนกัน (flow ไม่ถูก cooldown ของ level กัน)', () {
+      final lastEmitAt = <String, int>{'level:info': t0};
+      expect(
+        TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'flow',
+          type: 'info',
+          nowMs: t0 + oneMinute,
+        ),
+        isTrue,
+      );
+    });
+
+    test('ลำดับเหตุการณ์จริง: ระดับน้ำไหลลงเร็วจนข้าม 3 โซนใน 14 นาที', () {
+      // ถัง 400 ลิตร: เส้นแบ่ง 300 / 200 / 100 ลิตร
+      // เดิมการแจ้ง "ควรระวัง" และ "วิกฤต" ถูก info ตัวแรกบล็อกหายทั้งคู่
+      final lastEmitAt = <String, int>{};
+
+      bool emit(String type, int minute) {
+        final bool ok = TankAlertWatcher.canEmitNow(
+          lastEmitAt: lastEmitAt,
+          track: 'level',
+          type: type,
+          nowMs: t0 + minute * oneMinute,
+        );
+        if (ok) {
+          lastEmitAt[TankAlertWatcher.cooldownKeyOf('level', type)] =
+              t0 + minute * oneMinute;
+        }
+        return ok;
+      }
+
+      expect(emit('info', 0), isTrue); // 72.5% โซน 3→2 "ระดับน้ำ"
+      expect(emit('warning', 7), isTrue); // 47.5% โซน 2→1 "ควรระวัง"
+      expect(emit('critical', 14), isTrue); // 22.5% โซน 1→0 "วิกฤต"
+    });
+  });
+
+  // ==================================================================
+  // 🪣 เทสต์เกณฑ์ "ถังน้ำเต็ม" (≥ kFullPercent)
+  //    พอน้ำเต็ม ลูกลอยปิดวาล์วเอง อัตราไหลเข้าจึงตกเป็น 0 เองตามกลไก
+  //    และเติมจิ๋ว ๆ สลับหยุดทั้งวันทุกครั้งที่มีการใช้น้ำ
+  //    → ตอนถังเต็มต้องเงียบเรื่องการไหล เหลือแจ้งแค่ "ถังน้ำเต็มแล้ว"
+  // ==================================================================
+  group('TankAlertWatcher เกณฑ์ถังน้ำเต็ม', () {
+    WaterSnapshot at(double percent, {double flowRate = 0}) => WaterSnapshot(
+      capacity: 1000,
+      tankDepth: 185,
+      currentLiters: 1000 * percent / 100,
+      flowRate: flowRate,
+      usedToday: 0,
+      hourlyToday: const <HourlyUsage>[],
+      averageDailyLiters: 0,
+      recordedDays: 0,
+      peakDayLabel: null,
+      peakDayLiters: 0,
+      hasData: true,
+    );
+
+    test('fullStateOf ใช้เกณฑ์ ≥ 99% (ไม่ใช่ == 100 เป๊ะ ๆ)', () {
+      expect(TankAlertWatcher.fullStateOf(100.0), 'full');
+      expect(TankAlertWatcher.fullStateOf(99.9), 'full');
+      expect(TankAlertWatcher.fullStateOf(99.0), 'full');
+      expect(TankAlertWatcher.fullStateOf(98.9), 'not_full');
+      expect(TankAlertWatcher.fullStateOf(75.0), 'not_full');
+      expect(TankAlertWatcher.fullStateOf(0), 'not_full');
+    });
+
+    test('fullAlertFor แจ้งเฉพาะตอนเพิ่งเต็ม ไม่แจ้งตอนน้ำลดจากเต็ม', () {
+      final filled = TankAlertWatcher.fullAlertFor('full', at(100));
+      expect(filled, isNotNull);
+      expect(filled!.title, 'ถังน้ำเต็มแล้ว');
+      expect(filled.type, 'info');
+      expect(filled.message, contains('100%'));
+      expect(filled.message, contains('1000 ลิตร'));
+
+      // น้ำลดลงจากเต็ม = ใช้น้ำปกติ ไม่ต้องแจ้ง (โซน 75/50/25% ดูแลอยู่แล้ว)
+      expect(TankAlertWatcher.fullAlertFor('not_full', at(90)), isNull);
+    });
+
+    test('ถังเต็ม: ไม่แจ้ง "น้ำหยุดไหล" และ "น้ำกลับมาไหล" ทั้งสองทิศทาง', () {
+      // 100% — ลูกลอยปิดวาล์ว อัตราไหลตกเป็น 0 เอง
+      expect(
+        TankAlertWatcher.flowAlertFor('none', 'flowing', at(100)),
+        isNull,
+        reason: 'ถังเต็มแล้วน้ำหยุดไหลเองตามกลไก ไม่ใช่ปัญหา',
+      );
+      // 100% — ลูกลอยแง้มวาล์วเติมจิ๋ว ๆ หลังมีการใช้น้ำ
+      expect(
+        TankAlertWatcher.flowAlertFor('flowing', 'none', at(100, flowRate: 0.13)),
+        isNull,
+        reason: 'เติมจิ๋ว ๆ ตอนถังเต็มเกิดทั้งวัน แจ้งทุกครั้งจะเป็นสแปม',
+      );
+      // ขอบเขตล่างของ "เต็ม"
+      expect(TankAlertWatcher.flowAlertFor('none', 'flowing', at(99)), isNull);
+    });
+
+    test('ยังไม่เต็ม: การแจ้งเรื่องการไหลยังทำงานเหมือนเดิม', () {
+      final stopped = TankAlertWatcher.flowAlertFor(
+        'none',
+        'flowing',
+        at(98.9),
+      );
+      expect(stopped, isNotNull);
+      expect(stopped!.title, 'น้ำหยุดไหล');
+
+      final resumed = TankAlertWatcher.flowAlertFor(
+        'flowing',
+        'none',
+        at(40, flowRate: 2.5),
+      );
+      expect(resumed, isNotNull);
+      expect(resumed!.title, 'น้ำกลับมาไหล');
+      expect(resumed.message, contains('2.5 ลิตร/นาที'));
+    });
+
+    test('เติมน้ำจนเต็มแล้วใช้น้ำต่อ: แจ้ง "เต็มแล้ว" ครั้งเดียว', () {
+      // จำลองลำดับที่ _handleSnapshot ตัดสินใจจริง (ไม่คิด cooldown)
+      final List<String> titles = <String>[];
+      String lastFull = 'unknown';
+      for (final double pct in <double>[80, 95, 99.5, 100, 100, 97, 100]) {
+        final String full = TankAlertWatcher.fullStateOf(pct);
+        if (full == lastFull) continue;
+        final bool firstTime = lastFull == 'unknown';
+        lastFull = full;
+        if (firstTime) continue;
+        final alert = TankAlertWatcher.fullAlertFor(full, at(pct));
+        if (alert != null) titles.add('$pct:${alert.title}');
+      }
+
+      // 99.5 = เพิ่งเต็ม (แจ้ง) / 100 ซ้ำ = โซนเดิม (ไม่แจ้ง)
+      // 97 = หลุดจากเต็ม (ไม่แจ้ง) / กลับมา 100 = เพิ่งเต็มอีกครั้ง (แจ้ง)
+      expect(titles, <String>['99.5:ถังน้ำเต็มแล้ว', '100.0:ถังน้ำเต็มแล้ว']);
     });
   });
 

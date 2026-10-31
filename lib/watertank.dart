@@ -6,6 +6,7 @@ import 'history.dart'; // นำเข้าหน้า HistoryPage เพื�
 import 'notification.dart'; // นำเข้าหน้า NotificationPage เพื่อใช้ใน BottomNavigationBar
 import 'ai_page.dart'; // นำเข้าหน้า AiPage (ผู้ช่วย AI วิเคราะห์การใช้น้ำ)
 import 'notification_service.dart'; // ระบบเขียนการแจ้งเตือนอัตโนมัติ + เฝ้าดูสถานะถังน้ำ
+import 'main.dart' show MyHomePage; // หน้าเลือกขนาดแทงค์น้ำ (ปุ่มตั้งค่าบนการ์ดรูปถัง)
 
 class WaterTankPage extends StatefulWidget {
   const WaterTankPage({super.key});
@@ -439,142 +440,157 @@ class _WaterTankPageState extends State<WaterTankPage>
                   const SizedBox(height: 16),
 
                   // 🛢️ ภาพกราฟิกตัวถังน้ำและเอฟเฟกต์คลื่นน้ำเคลื่อนไหวแบบ smooth
-                  Container(
-                    width: 500.0, // กำหนดความกว้างของ Container
-                    height: 320.0, // กำหนดความสูงของ Container
-                    alignment:
-                        Alignment.center, // จัดให้ Stack อยู่ตรงกลางกล่อง
-                    padding: const EdgeInsets.all(
-                      20.0,
-                    ), // ขยาย Padding ให้กว้างขึ้น
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(16.0),
-                      border: Border.all(color: Colors.grey.shade200),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.grey.withOpacity(0.08),
-                          spreadRadius: 1,
-                          blurRadius: 6,
-                          offset: const Offset(0, 3),
-                        ),
-                      ],
-                    ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        Stack(
-                          alignment: Alignment.bottomCenter,
-                          children: [
-                            // ตัวถังพื้นหลัง (ขอบถัง)
-                            Container(
-                              width: 160,
-                              height: 240,
-                              decoration: BoxDecoration(
-                                color: Colors.grey.shade100,
-                                border: Border.all(
-                                  color: const Color.fromARGB(255, 53, 55, 56),
-                                  width: 4,
-                                ),
-                                borderRadius: const BorderRadius.vertical(
-                                  top: Radius.circular(20),
-                                  bottom: Radius.circular(10),
-                                ),
-                              ),
+                  //    ครอบด้วย Stack เพื่อวางปุ่ม "ตั้งค่าขนาดถัง" ทับมุมขวาบนของการ์ด
+                  //    Container เป็นลูกที่ไม่ Positioned → Stack จึงมีขนาดเท่าการ์ดพอดี
+                  //    ทำให้ Positioned อ้างอิงมุมขวาบนของการ์ดได้ตรงตำแหน่ง
+                  Stack(
+                    children: <Widget>[
+                      Container(
+                        width: 500.0, // กำหนดความกว้างของ Container
+                        height: 320.0, // กำหนดความสูงของ Container
+                        alignment:
+                            Alignment.center, // จัดให้ Stack อยู่ตรงกลางกล่อง
+                        padding: const EdgeInsets.all(
+                          20.0,
+                        ), // ขยาย Padding ให้กว้างขึ้น
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(16.0),
+                          border: Border.all(color: Colors.grey.shade200),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.grey.withOpacity(0.08),
+                              spreadRadius: 1,
+                              blurRadius: 6,
+                              offset: const Offset(0, 3),
                             ),
-                            // 🌊 คลื่นน้ำเคลื่อนไหวภายในถัง ครอบด้วย ClipRRect ให้โค้งตามขอบถัง
-                            ClipRRect(
-                              borderRadius: const BorderRadius.vertical(
-                                top: Radius.circular(18),
-                                bottom: Radius.circular(8),
-                              ),
-                              child: SizedBox(
-                                width: 152,
-                                height: 232,
-                                child: TweenAnimationBuilder<double>(
-                                  // 🎯 ค่อยๆ ไล่ระดับน้ำจากค่าเดิมไปค่าใหม่อย่างนุ่มนวลเมื่อข้อมูลเปลี่ยน
-                                  tween: Tween<double>(
-                                    begin: _displayedPercent,
-                                    end: waterPercent,
+                          ],
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            Stack(
+                              alignment: Alignment.bottomCenter,
+                              children: [
+                                // ตัวถังพื้นหลัง (ขอบถัง)
+                                Container(
+                                  width: 160,
+                                  height: 240,
+                                  decoration: BoxDecoration(
+                                    color: Colors.grey.shade100,
+                                    border: Border.all(
+                                      color: const Color.fromARGB(255, 53, 55, 56),
+                                      width: 4,
+                                    ),
+                                    borderRadius: const BorderRadius.vertical(
+                                      top: Radius.circular(20),
+                                      bottom: Radius.circular(10),
+                                    ),
                                   ),
-                                  duration: const Duration(milliseconds: 800),
-                                  curve: Curves.easeInOutCubic,
-                                  onEnd: () {
-                                    _displayedPercent = waterPercent;
-                                  },
-                                  builder: (context, animatedPercent, child) {
-                                    return AnimatedBuilder(
-                                      animation: _waveController,
-                                      builder: (context, _) {
-                                        return CustomPaint(
-                                          painter: _WavePainter(
-                                            progress: animatedPercent / 100,
-                                            phase: _waveController.value,
-                                            colors: waterGradient,
-                                          ),
-                                          size: const Size(152, 232),
+                                ),
+                                // 🌊 คลื่นน้ำเคลื่อนไหวภายในถัง ครอบด้วย ClipRRect ให้โค้งตามขอบถัง
+                                ClipRRect(
+                                  borderRadius: const BorderRadius.vertical(
+                                    top: Radius.circular(18),
+                                    bottom: Radius.circular(8),
+                                  ),
+                                  child: SizedBox(
+                                    width: 152,
+                                    height: 232,
+                                    child: TweenAnimationBuilder<double>(
+                                      // 🎯 ค่อยๆ ไล่ระดับน้ำจากค่าเดิมไปค่าใหม่อย่างนุ่มนวลเมื่อข้อมูลเปลี่ยน
+                                      tween: Tween<double>(
+                                        begin: _displayedPercent,
+                                        end: waterPercent,
+                                      ),
+                                      duration: const Duration(milliseconds: 800),
+                                      curve: Curves.easeInOutCubic,
+                                      onEnd: () {
+                                        _displayedPercent = waterPercent;
+                                      },
+                                      builder: (context, animatedPercent, child) {
+                                        return AnimatedBuilder(
+                                          animation: _waveController,
+                                          builder: (context, _) {
+                                            return CustomPaint(
+                                              painter: _WavePainter(
+                                                progress: animatedPercent / 100,
+                                                phase: _waveController.value,
+                                                colors: waterGradient,
+                                              ),
+                                              size: const Size(152, 232),
+                                            );
+                                          },
                                         );
                                       },
-                                    );
-                                  },
-                                ),
-                              ),
-                            ),
-                            // ตัวเลขเปอร์เซ็นต์กลางถัง
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 100),
-                              child: Text(
-                                '${waterPercent.toStringAsFixed(1)}%',
-                                style: TextStyle(
-                                  fontSize: 22,
-                                  fontWeight: FontWeight.bold,
-                                  color: waterPercent > 55
-                                      ? Colors.white
-                                      : const Color.fromARGB(255, 0, 0, 0),
-                                  shadows: const [
-                                    Shadow(
-                                      color: Colors.black26,
-                                      blurRadius: 4,
                                     ),
-                                  ],
+                                  ),
                                 ),
+                                // ตัวเลขเปอร์เซ็นต์กลางถัง
+                                Padding(
+                                  padding: const EdgeInsets.only(bottom: 100),
+                                  child: Text(
+                                    '${waterPercent.toStringAsFixed(1)}%',
+                                    style: TextStyle(
+                                      fontSize: 22,
+                                      fontWeight: FontWeight.bold,
+                                      color: waterPercent > 55
+                                          ? Colors.white
+                                          : const Color.fromARGB(255, 0, 0, 0),
+                                      shadows: const [
+                                        Shadow(
+                                          color: Colors.black26,
+                                          blurRadius: 4,
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(width: 6),
+                            // 📏 สเกลตัวเลขบอกปริมาณน้ำด้านข้างถัง (100 -> 0)
+                            SizedBox(
+                              height: 240,
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [100, 75, 50, 25, 0].map((mark) {
+                                  return Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Container(
+                                        width: 6,
+                                        height: 1.5,
+                                        color: Colors.grey.shade400,
+                                      ),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        '$mark',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w600,
+                                          color: Colors.grey.shade500,
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                }).toList(),
                               ),
                             ),
                           ],
                         ),
-                        const SizedBox(width: 6),
-                        // 📏 สเกลตัวเลขบอกปริมาณน้ำด้านข้างถัง (100 -> 0)
-                        SizedBox(
-                          height: 240,
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [100, 75, 50, 25, 0].map((mark) {
-                              return Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Container(
-                                    width: 6,
-                                    height: 1.5,
-                                    color: Colors.grey.shade400,
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    '$mark',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w600,
-                                      color: Colors.grey.shade500,
-                                    ),
-                                  ),
-                                ],
-                              );
-                            }).toList(),
-                          ),
+                      ),
+                      // ⚙️ ปุ่มตั้งค่าขนาดแทงค์น้ำ — มุมขวาบนของการ์ดรูปถัง
+                      Positioned(
+                        top: 12,
+                        right: 12,
+                        child: _TankSizeSettingButton(
+                          onTap: _openTankSizeSetting,
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                   const SizedBox(height: 15),
 
@@ -893,6 +909,20 @@ class _WaterTankPageState extends State<WaterTankPage>
   }
 
   // ฟังก์ชันสลับชื่อพาดหัวบนแถบ AppBar
+  // -----------------------------------------------------------------
+  // ⚙️ ไปหน้า "เลือกขนาดแทงค์น้ำ" (MyHomePage ใน main.dart)
+  //    หน้านั้นเมื่อกดบันทึกสำเร็จจะ pushAndRemoveUntil กลับมาที่
+  //    WaterTankPage เองอยู่แล้ว จึงไม่ต้องรอค่าที่ส่งกลับมา
+  //    (ระดับน้ำ/ความจุใหม่จะไหลเข้ามาทาง onValue ของ Firebase เอง)
+  // -----------------------------------------------------------------
+  void _openTankSizeSetting() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => const MyHomePage(title: 'ขนาดแทงค์น้ำ'),
+      ),
+    );
+  }
+
   String _getAppBarTitle(int index) {
     switch (index) {
       case 0:
@@ -910,6 +940,45 @@ class _WaterTankPageState extends State<WaterTankPage>
 }
 
 // 🧊 ปุ่มไอคอนทรงกลมมนบนแถบ AppBar (ให้เข้ากับดีไซน์การ์ดมุมโค้งของทั้งแอป)
+// ⚙️ ปุ่มตั้งค่าขนาดแทงค์น้ำ ที่วางทับมุมขวาบนของการ์ดรูปถัง
+//    ใช้พื้นขาวทึบ + เงาจาง ๆ เพื่อให้อ่านออกแม้ซ้อนทับคลื่นน้ำสีเข้ม
+class _TankSizeSettingButton extends StatelessWidget {
+  final VoidCallback onTap;
+
+  const _TankSizeSettingButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'ตั้งค่าขนาดแทงค์น้ำ',
+      child: Material(
+        color: Colors.white,
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        elevation: 2,
+        shadowColor: Colors.black.withValues(alpha: 0.25),
+        child: InkWell(
+          onTap: onTap,
+          child: Container(
+            width: 38,
+            height: 38,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.grey.shade200),
+            ),
+            child: const Icon(
+              Icons.settings_outlined,
+              size: 20,
+              color: Color(0xFF2F80ED),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _AppBarCircleButton extends StatelessWidget {
   final IconData icon;
   final String tooltip;

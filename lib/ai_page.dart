@@ -111,8 +111,9 @@ class _AiPageState extends State<AiPage> {
   /// เพื่อกันยิงซ้ำและให้ทุกแท็บเห็นตรงกัน แต่การ์ด "สรุปการใช้น้ำ" แสดงเฉพาะประโยค
   /// ที่คำนวณจากเกณฑ์ระดับน้ำ (water_tips.dart) จึงไม่เก็บ [คำแนะนำ] ไว้ในหน่วยความจำ
 
-  /// ผลคาดการณ์ 5 วันจาก AI (null = ยังไม่มี หรือตอบไม่ถูกต้อง → ใช้สูตรระบบ)
-  AiForecast? _forecast;
+  /// หมายเหตุ: บล็อก [คาดการณ์] ของ AI ยังถูกบันทึกลง `ai_state/last_forecast` ไว้
+  /// เป็นหลักฐาน แต่ไม่ได้ถูกนำมาแสดงบนจอแล้ว — กราฟ 5 วันคำนวณจากสูตรระบบล้วน
+  /// (`averageDrivenForecast`) จึงไม่ต้องเก็บผลที่ parse แล้วไว้ในหน่วยความจำ
 
   String? _error;
 
@@ -181,14 +182,9 @@ class _AiPageState extends State<AiPage> {
       );
       if (!mounted) return;
 
+      // เก็บไว้เฉพาะสถานะการยิง (กันยิงซ้ำ) — เนื้อหาคำตอบของ AI ไม่ได้แสดงบนจอแล้ว
       setState(() {
         _aiState = loaded;
-
-        // นำผลคาดการณ์ 5 วันล่าสุดที่เคยบันทึกไว้กลับมาใช้หลังรีสตาร์ท/เปิดแอปซ้ำ
-        // (ส่วน [สรุป] และ [คำแนะนำ] ของ AI ไม่ได้แสดงบนการ์ดแล้ว จึงไม่ต้องเก็บไว้)
-        if ((loaded.lastForecast ?? '').trim().isNotEmpty) {
-          _forecast = _forecastFromState(loaded);
-        }
       });
     } catch (e) {
       debugPrint('อ่านสถานะ AI จาก Firebase ไม่สำเร็จ: $e');
@@ -355,14 +351,9 @@ class _AiPageState extends State<AiPage> {
 
       final String narrative = narrativeOf(reply);
       final List<String> tips = tipsOf(reply);
-      final AiForecast? forecast = forecastFromReply(
-        reply,
-        currentPercent: percentAtCall,
-      );
       final String? forecastRaw = forecastBlockOf(reply);
 
       setState(() {
-        _forecast = forecast;
         _isAnalyzing = false;
       });
 
@@ -389,19 +380,6 @@ class _AiPageState extends State<AiPage> {
       _error = message;
       _isAnalyzing = false;
     });
-  }
-
-  // ------------------------------------------------------------------
-  // 🧩 แยกคำตอบดิบของ AI (ย้ายไปไว้ที่ ai_reply.dart แล้ว — ดู narrativeOf/
-  //    tipsOf/forecastFromReply) และแปลงผลคาดการณ์ที่บันทึกไว้กลับมาใช้
-  // ------------------------------------------------------------------
-  AiForecast? _forecastFromState(AiState state) {
-    final String? raw = state.lastForecast;
-    if (raw == null || raw.trim().isEmpty) return null;
-    return forecastFromBlock(
-      raw,
-      currentPercent: state.lastPercent ?? _snapshot.percent,
-    );
   }
 
   // ------------------------------------------------------------------
@@ -691,7 +669,7 @@ class _AiPageState extends State<AiPage> {
         s.hasReliableAverage ? _fmtNum(s.averageDailyLiters) : '--';
 
     final String note = s.hasReliableAverage
-        ? 'จากวันเต็มวัน ${s.recordedDays} วัน'
+        ? 'เฉลี่ย ${s.recordedDays} วัน'
         : 'ข้อมูลยังไม่พอ ${s.recordedDays}/$kMinFullDaysForAverage วัน';
 
     return Row(
@@ -798,7 +776,7 @@ class _AiPageState extends State<AiPage> {
               ),
             ],
           ),
-          // 📅 บรรทัดเล็กบอกที่มาของตัวเลข (เช่น "จากวันเต็มวัน 5 วัน")
+          // 📅 บรรทัดเล็กบอกที่มาของตัวเลข (เช่น "เฉลี่ย 5 วัน")
           if (subtitle != null) ...<Widget>[
             const SizedBox(height: 6),
             Text(
@@ -821,12 +799,12 @@ class _AiPageState extends State<AiPage> {
   // 📈 การ์ด "คาดการณ์จาก AI" — แนวโน้มระดับน้ำ 5 วัน
   //    • เปอร์เซ็นต์/ระดับความเสี่ยง "ยึดค่าเฉลี่ยการใช้น้ำ" (สูตรระบบ) เสมอ
   //      เพื่อให้สอดคล้องกับจำนวนวันคงเหลือและการ์ดค่าเฉลี่ย
-  //    • AI ให้เฉพาะ "เหตุผลสั้น ๆ" ของแต่ละวัน (ใช้เป็นข้อความแนวโน้ม)
+  //    • ไม่มีข้อความจาก AI บนการ์ดนี้แล้ว (เดิมมีบรรทัด "แนวโน้ม: ..." ถูกนำออก)
+  //      บล็อก [คาดการณ์] ที่ AI ตอบมายังถูกบันทึกไว้ที่ ai_state/last_forecast เท่านั้น
   // ------------------------------------------------------------------
   Widget _buildForecastCard() {
     final List<String> labels = forecastDateLabels(DateTime.now());
     final List<ForecastDay> days = _forecastDays();
-    final Widget? insight = _forecastInsight(days);
 
     return _card(
       child: Column(
@@ -863,11 +841,6 @@ class _AiPageState extends State<AiPage> {
           // แบนเนอร์เวลาที่คาดว่าน้ำจะหมด (ยึดค่าเฉลี่ยการใช้น้ำ)
           if (_snapshot.hasData && _snapshot.capacity > 0)
             _buildEtaBanner(labels),
-          // ข้อความแนวโน้มสั้น ๆ จาก AI (ถ้ามีเหตุผลแนบมา)
-          if (insight != null) ...<Widget>[
-            const SizedBox(height: 10),
-            insight,
-          ],
           const SizedBox(height: 14),
           _forecastChart(days, labels),
           if (_isAnalyzing) ...<Widget>[
@@ -893,14 +866,8 @@ class _AiPageState extends State<AiPage> {
   }
   /// 📅 สร้างรายการ 5 วันที่จะแสดง — "ยึดค่าเฉลี่ยการใช้น้ำ" ล้วน ๆ
   ///    เปอร์เซ็นต์คำนวณจาก averageDailyLiters (สูตรระบบ ผ่าน averageDrivenForecast)
-  ///    ไม่ใช้ตัวเลขที่ AI เดาเอง (AI เหลือบทบาทแค่ให้เหตุผลสั้น ๆ เป็น "แนวโน้ม")
+  ///    ไม่ใช้ตัวเลขที่ AI เดาเอง และไม่แนบ notes (ข้อความแนวโน้มถูกนำออกแล้ว)
   List<ForecastDay> _forecastDays() {
-    final AiForecast? ai = _forecast;
-    final Map<int, String> notes = <int, String>{
-      if (ai != null)
-        for (final ForecastDay d in ai.days)
-          if (d.note.isNotEmpty) d.day: d.note,
-    };
     return averageDrivenForecast(
       currentPercent: _snapshot.percent,
       // ยังไม่ครบเกณฑ์วันเต็มวัน → ส่ง 0 เพื่อให้กราฟ "นิ่ง" ที่เปอร์เซ็นต์ปัจจุบัน
@@ -908,7 +875,6 @@ class _AiPageState extends State<AiPage> {
       averageDailyLiters:
           _snapshot.hasReliableAverage ? _snapshot.averageDailyLiters : 0,
       capacity: _snapshot.capacity,
-      notes: notes,
     );
   }
 
@@ -1060,36 +1026,6 @@ class _AiPageState extends State<AiPage> {
           borderRadius: const BorderRadius.vertical(top: Radius.circular(6)),
         ),
       ),
-    );
-  }
-
-  /// ✨ ข้อความแนวโน้มจาก AI (ของวันที่น่าเป็นห่วงที่สุด) — ว่างก็ไม่แสดง
-  Widget? _forecastInsight(List<ForecastDay> days) {
-    ForecastDay? pick;
-    for (final ForecastDay d in days) {
-      if (d.note.isEmpty) continue;
-      if (pick == null || d.percent < pick.percent) pick = d;
-    }
-    if (pick == null) return null;
-    final ForecastDay day = pick;
-
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        const Icon(Icons.auto_awesome, size: 14, color: Color(0xFF7C5CFF)),
-        const SizedBox(width: 7),
-        Expanded(
-          child: Text(
-            'แนวโน้ม: ${day.note}',
-            style: TextStyle(
-              fontSize: 11.5,
-              height: 1.4,
-              fontWeight: FontWeight.w500,
-              color: notificationColorFor(day.level),
-            ),
-          ),
-        ),
-      ],
     );
   }
 
