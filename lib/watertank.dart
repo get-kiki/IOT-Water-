@@ -8,6 +8,16 @@ import 'ai_page.dart'; // นำเข้าหน้า AiPage (ผู้ช่
 import 'notification_service.dart'; // ระบบเขียนการแจ้งเตือนอัตโนมัติ + เฝ้าดูสถานะถังน้ำ
 import 'main.dart' show MyHomePage; // หน้าเลือกขนาดแทงค์น้ำ (ปุ่มตั้งค่าบนการ์ดรูปถัง)
 
+/// ⏳ ตอนเปิดแอป ถ้ามีการแจ้งเตือนที่ "ยังไม่อ่าน" และเกิดขึ้นภายในช่วงเวลานี้
+/// จะเด้ง SnackBar ให้เห็นด้วย
+///
+/// จำเป็นเพราะตรรกะตรวจเกณฑ์ย้ายไปอยู่บนบอร์ด ESP32 แล้ว การแจ้งเตือนจึง
+/// เกิดขึ้นได้ตอนที่แอปปิดอยู่ ถ้าไม่มีช่วงเวลานี้ ผู้ใช้เปิดแอปมาจะไม่เห็น
+/// อะไรเด้งเลย ทั้งที่น้ำเพิ่งเข้าระดับวิกฤตไปเมื่อสักครู่
+///
+/// ตั้งสั้น ๆ ไว้เพื่อไม่ให้แจ้งเตือนเก่าค้างวันเด้งย้อนหลังตอนเปิดแอป
+const Duration kRecentAlertWindow = Duration(minutes: 10);
+
 class WaterTankPage extends StatefulWidget {
   const WaterTankPage({super.key});
 
@@ -24,7 +34,11 @@ class _WaterTankPageState extends State<WaterTankPage>
   StreamSubscription<DatabaseEvent>? _streamSubscription;
 
   // 🔔 ตัวเฝ้าดูสถานะถังน้ำ แล้วเขียนการแจ้งเตือนอัตโนมัติลง Firebase
-  late final TankAlertWatcher _alertWatcher;
+  // 🔔 id ของการแจ้งเตือนที่เคยเห็นแล้ว (ใช้หาว่าใบไหน "ใหม่จริง")
+  //    _notiPrimed = false ระหว่างรอ snapshot แรก ซึ่งเป็นรายการที่มีอยู่ก่อนแล้ว
+  //    จึงต้องไม่เด้ง SnackBar ย้อนหลังทั้งกองตอนเปิดแอป
+  final Set<String> _seenNotiIds = <String>{};
+  bool _notiPrimed = false;
 
   // ตัวแปรสำหรับเก็บข้อมูลเรียลไทม์ที่ดึงมาจาก Firebase
   double _currentLiters = 0;
@@ -77,34 +91,103 @@ class _WaterTankPageState extends State<WaterTankPage>
     // 🚀 เริ่มต้นการดักฟังข้อมูลเรียลไทม์จาก Firebase แบบปลอดภัย
     _initFirebaseStream();
 
-    // 🔔 เริ่มเฝ้าดูสถานะถัง แล้วเขียนการแจ้งเตือนอัตโนมัติเมื่อถึงเกณฑ์
-    //    (ต่ำกว่า 20% = วิกฤต, ต่ำกว่า 50% = ควรระวัง, ไหลผิดปกติ ฯลฯ)
-    _alertWatcher = TankAlertWatcher(onAlert: _handleTankAlert);
-    _alertWatcher.start();
+    // 🔔 ไม่ต้องสร้าง TankAlertWatcher ที่นี่อีกแล้ว
+    //    ตรรกะตรวจเกณฑ์ย้ายไปอยู่บนบอร์ด ESP32 (HC-SR04device.txt → checkAlerts())
+    //    เพราะบอร์ดเปิด 24/7 จึงแจ้งเตือนได้แม้ผู้ใช้ปิดแอป
+    //    ถ้าเปิดตัวนี้ด้วยจะได้การแจ้งเตือนซ้ำ 2 ใบทุกครั้ง
+    //
+    //    ⚠️ โค้ด TankAlertWatcher + เทสต์ใน test/water_ai_logic_test.dart
+    //       ยังเก็บไว้เป็น "สเปกอ้างอิง" ของเกณฑ์ ค่าคงที่สองฝั่งต้องตรงกัน
 
-    // 🔢 ดักฟังจำนวนการแจ้งเตือนที่ยังไม่อ่าน เพื่อโชว์ป้ายบนไอคอนระฆัง
-    _initUnreadBadge();
+    // 🔢 ดักฟังการแจ้งเตือน: นับใบที่ยังไม่อ่าน + เด้ง SnackBar เมื่อมีใบใหม่
+    _initNotificationListener();
   }
 
   // -----------------------------------------------------------------
-  // 🔢 นับจำนวนการแจ้งเตือนที่ยังไม่อ่าน (is_read == false) แบบเรียลไทม์
+  // 🔢 ดักฟัง water_system/notifications ตัวเดียว ใช้ทำ 2 อย่าง
+  //    1. นับจำนวนที่ยังไม่อ่าน (is_read == false) โชว์ป้ายบนไอคอนระฆัง
+  //    2. ตรวจว่ามีใบใหม่เข้ามาไหม แล้วเด้ง SnackBar
+  //
+  //    เดิม SnackBar ถูกเรียกผ่าน onAlert ของ TankAlertWatcher ในแอป
+  //    พอย้ายตรรกะไปบอร์ดแล้ว จึงต้องรู้ว่า "มีใบใหม่" จากฝั่ง Firebase แทน
+  //    วิธีนี้ไม่เพิ่ม listener ใหม่ (ใช้ตัวที่นับป้ายอยู่แล้ว) จึงไม่เปลืองโควตา
   // -----------------------------------------------------------------
-  void _initUnreadBadge() {
+  void _initNotificationListener() {
     final notiRef = FirebaseDatabase.instance.ref('water_system/notifications');
-    _notiSubscription = notiRef.onValue.listen((event) {
-      if (!mounted) return;
-      final value = event.snapshot.value;
-      int unread = 0;
-      if (value is Map) {
-        final data = Map<dynamic, dynamic>.from(value);
-        for (final entry in data.values) {
-          if (entry is Map && entry['is_read'] == false) unread++;
+    _notiSubscription = notiRef.onValue.listen(
+      (event) {
+        if (!mounted) return;
+        final value = event.snapshot.value;
+
+        final bool firstSnapshot = !_notiPrimed;
+        final int nowMs = DateTime.now().millisecondsSinceEpoch;
+
+        int unread = 0;
+        final Set<String> ids = <String>{};
+        // ใบที่ควรเด้ง SnackBar ในรอบนี้ (เก็บ timestamp ไว้เรียงหาใบใหม่สุด)
+        final List<({int timestamp, TankAlert alert})> fresh = [];
+
+        if (value is Map) {
+          final data = Map<dynamic, dynamic>.from(value);
+          for (final entry in data.entries) {
+            final String id = entry.key.toString();
+            final dynamic raw = entry.value;
+            if (raw is! Map) continue;
+
+            ids.add(id);
+            final bool isUnread = raw['is_read'] == false;
+            if (isUnread) unread++;
+
+            final dynamic ts = raw['timestamp'];
+            final int timestamp = ts is num ? ts.toInt() : 0;
+
+            // 🔔 เงื่อนไขว่าใบนี้ควรเด้ง SnackBar ไหม
+            //
+            //  • snapshot ถัดๆ ไป → เด้งถ้าเป็น id ที่ไม่เคยเห็น (ของใหม่แท้ ๆ)
+            //
+            //  • snapshot แรก (ตอนเปิดแอป) → เด้งถ้า "ยังไม่อ่าน + เพิ่งเกิด"
+            //    ภายใน kRecentAlertWindow เพราะตรรกะตรวจเกณฑ์ย้ายไปอยู่บนบอร์ด
+            //    แล้ว การแจ้งเตือนจึงเกิดขึ้นได้ตอนที่แอปปิดอยู่ ถ้าไม่เช็กตรงนี้
+            //    ผู้ใช้เปิดแอปมาจะไม่เห็นอะไรเด้งเลย ทั้งที่น้ำเพิ่งวิกฤตไปเมื่อกี้
+            //    (เช็ก is_read ด้วย เพื่อไม่เด้งซ้ำใบที่เคยอ่านแล้ว)
+            final bool shouldPop = firstSnapshot
+                ? (isUnread &&
+                    timestamp > 0 &&
+                    nowMs - timestamp <= kRecentAlertWindow.inMilliseconds)
+                : !_seenNotiIds.contains(id);
+
+            if (shouldPop) {
+              fresh.add((
+                timestamp: timestamp,
+                alert: TankAlert(
+                  title: (raw['title'] ?? 'แจ้งเตือน').toString(),
+                  message: (raw['message'] ?? '').toString(),
+                  type: (raw['type'] ?? 'info').toString(),
+                ),
+              ));
+            }
+          }
         }
-      }
-      if (unread != _unreadCount) {
-        setState(() => _unreadCount = unread);
-      }
-    });
+
+        _seenNotiIds
+          ..clear()
+          ..addAll(ids);
+        _notiPrimed = true;
+
+        if (unread != _unreadCount) {
+          setState(() => _unreadCount = unread);
+        }
+
+        if (fresh.isEmpty) return;
+
+        // มาหลายใบพร้อมกัน → เด้งเฉพาะใบใหม่สุด (กันเด้งทับกันรัว ๆ)
+        fresh.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+        _handleTankAlert(fresh.last.alert);
+      },
+      onError: (error) {
+        debugPrint('Firebase notifications stream error: $error');
+      },
+    );
   }
 
   void _initFirebaseStream() {
@@ -153,8 +236,14 @@ class _WaterTankPageState extends State<WaterTankPage>
   // -----------------------------------------------------------------
   void _handleTankAlert(TankAlert alert) {
     if (!mounted) return;
-    // ถ้าผู้ใช้เปิดหน้าจอการแจ้งเตือนอยู่แล้ว ก็ไม่ต้องเด้งซ้ำ
-    if (_selectedIndex == 3) return;
+
+    // 🔔 เด้งทุกแท็บ รวมถึงแท็บการแจ้งเตือนเอง
+    //
+    //    เดิมมี `if (_selectedIndex == 3) return;` กันไม่ให้เด้งตอนผู้ใช้
+    //    เปิดหน้าแจ้งเตือนอยู่ เพราะถือว่าเห็นในลิสต์แล้ว ไม่ต้องเด้งซ้ำ
+    //    แต่ทำให้ทดสอบจากแท็บนั้นแล้วเหมือนระบบไม่ทำงาน จึงเอาออก
+    //    (ตรรกะตรวจเกณฑ์ย้ายไปบอร์ดแล้ว การเห็น SnackBar ยืนยันว่าข้อมูล
+    //     เดินทางจากบอร์ด -> Firebase -> แอป ครบวงจรจริง)
 
     // 🎨 ใช้สี/ไอคอนชุดเดียวกับหน้าแจ้งเตือน (notification.dart) กันข้อความไม่ตรงกัน
     final Color color = notificationColorFor(alert.type);
@@ -212,7 +301,7 @@ class _WaterTankPageState extends State<WaterTankPage>
     // 🚀 ปิดและทำลายตัวเชื่อมต่อสตรีมทันทีเมื่อปิดหน้านี้ เพื่อคืนพื้นที่แรม ป้องกันแอปค้าง
     _streamSubscription?.cancel();
     _notiSubscription?.cancel();
-    _alertWatcher.stop();
+    // ไม่มี TankAlertWatcher ให้ stop อีกแล้ว (ย้ายไปตรวจเกณฑ์บนบอร์ด ESP32)
     _waveController.dispose();
     _entranceController.dispose();
     super.dispose();

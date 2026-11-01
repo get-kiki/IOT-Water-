@@ -31,6 +31,7 @@
 #include <WiFiManager.h>          // ติดตั้ง "WiFiManager" by tzapu
 #include <FirebaseESP32.h>
 #include <EEPROM.h>
+#include <time.h>                 // ใช้ NTP ทำ timestamp ของการแจ้งเตือน
 // ---------- โหมดทดสอบ ----------
 // #define TEST_PORTAL             // <<< ปิดแล้ว (โหมดใช้งานจริง) เปิดใหม่ได้ถ้าต้องทดสอบ WiFi
 // ---------- Firebase ----------
@@ -76,6 +77,57 @@ const float FULL_DIST = 4.0;
 // ถ้า % ล่าสุด >= NEAR_FULL_PERCENT และอ่านพลาดติดกัน FULL_FAIL_COUNT ครั้ง -> ถือว่าเต็ม
 const float NEAR_FULL_PERCENT = 95.0;
 const int   FULL_FAIL_COUNT   = 10;     // 10 ครั้ง x 100 ms = 1 วิ
+
+// =====================================================================
+// 🔔 การแจ้งเตือน — ย้ายมาตรวจที่บอร์ด เพื่อให้แจ้งได้แม้ปิดแอป
+//
+//    เดิมตรรกะนี้อยู่ใน lib/notification_service.dart (TankAlertWatcher)
+//    ซึ่งทำงานในแอป ปิดแอปแล้วไม่มีใครตรวจ การแจ้งเตือนจึงขาดช่วง
+//    ตอนนี้บอร์ด (เปิด 24/7) เป็นคนตรวจแล้วเขียนลง water_system/notifications
+//    ด้วย schema เดิม หน้าแจ้งเตือนในแอปจึงไม่ต้องแก้อะไรเลย
+//
+//    ⚠️ ค่าคงที่ด้านล่างต้องตรงกับ lib/notification_service.dart
+//       (kCriticalPercent / kWarningPercent / kNormalPercent / kFullPercent
+//        / kAlertCooldown / kFlowCooldown / kAiFlowActiveLpm)
+//       ถ้าแก้ที่ไหน ต้องแก้ให้ตรงกันทั้งสองฝั่ง
+// =====================================================================
+#define GMT_OFFSET_SEC (7 * 3600)   // ประเทศไทย UTC+7
+#define NTP_SERVER     "pool.ntp.org"
+
+const float ALERT_CRITICAL_PERCENT = 25.0;   // <= 25%  วิกฤต
+const float ALERT_WARNING_PERCENT  = 50.0;   // <= 50%  ควรระวัง
+const float ALERT_NORMAL_PERCENT   = 75.0;   // <= 75%  ระดับน้ำ / เกินนี้ = ปกติ
+const float ALERT_FULL_PERCENT     = 99.0;   // >= 99%  ถังเต็ม
+const float ALERT_FLOW_ACTIVE_LPM  = 0.01;   // > ค่านี้ = ถือว่ามีน้ำไหล
+
+// ⏱️ cooldown ของราง level/full = 0 คือ "แจ้งทันทีทุกครั้งที่ข้ามโซน" (real-time)
+//
+// 🐛 เดิมตั้งไว้ 15 นาที แล้วทำให้การแจ้งเตือน delay นานผิดปกติ เพราะโค้ดด้านล่าง
+//    ตั้งใจ "ไม่ commit lastZone" ตอนติด cooldown เพื่อไม่ให้การแจ้งหายถาวร
+//    มันจึงวนลองใหม่ทุกรอบจนพ้น cooldown => แจ้งแน่ แต่ช้าได้ถึง 15 นาที
+//
+// ⚠️ ผลข้างเคียงที่ต้องรู้: ถ้าระดับน้ำนิ่งพอดีที่เส้นแบ่งโซน (เช่น 25.0%)
+//    ค่าที่กรองแล้วอาจแกว่งข้ามเส้นไปมา ทำให้แจ้งถี่ ๆ ได้
+//    ถ้าเจออาการนั้น ใส่ค่ากลับเป็น 30UL * 1000UL (30 วินาที) ก็พอกันได้แล้ว
+//
+// 📌 ค่านี้ "ไม่ตรง" กับ kAlertCooldown (15 นาที) ใน lib/notification_service.dart
+//    โดยเจตนา — ฝั่ง Dart เป็นสเปกอ้างอิง/ชุดเทสต์ ไม่ใช่โค้ดที่ทำงานจริงแล้ว
+const unsigned long ALERT_COOLDOWN_MS = 0;   // 0 = ไม่มี cooldown
+
+// สถานะล่าสุดที่เคยแจ้ง (-1 / "unknown" = ยังไม่รู้ -> รอบแรกจำเงียบ ๆ ไม่แจ้ง)
+int    lastZone = -1;
+String lastFull = "unknown";
+String lastFlow = "unknown";
+float  lastFlowRate = 0.0;
+
+// เวลาแจ้งล่าสุด แยกตามระดับ [0]=critical [1]=warning [2]=info (0 = ยังไม่เคยแจ้ง)
+unsigned long emitAtLevel[3] = {0, 0, 0};
+unsigned long emitAtFull[3]  = {0, 0, 0};
+
+unsigned long lastFlowPollTime  = 0;
+unsigned long lastAlertCheckTime = 0;
+const unsigned long FLOW_POLL_INTERVAL  = 3000;   // ดึง flow_rate_min ทุก 3 วิ
+const unsigned long ALERT_CHECK_INTERVAL = 1000;  // ตรวจเกณฑ์ทุก 1 วิ (เดิม 2 วิ)
 
 // ค่าระดับน้ำ
 float samples[SAMPLE_COUNT];
@@ -315,6 +367,171 @@ void drawWaterTank(int x, int y, int w, int h, int percent) {
   }
 }
 // -------------------------------------------------------
+// -------------------------------------------------------
+// escape อักขระที่ทำ JSON พัง (ข้อความไทยไม่มีปัญหา แต่กันไว้)
+String jsonEscape(const String &s) {
+  String out;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if (c == '\n')        { out += "\\n"; }
+    else                       { out += c; }
+  }
+  return out;
+}
+// -------------------------------------------------------
+// เวลาปัจจุบันเป็น epoch milliseconds (0 = NTP ยังไม่ sync)
+// หน้าแจ้งเตือนในแอปใช้ DateTime.fromMillisecondsSinceEpoch(timestamp)
+// ถ้าส่ง millis() ไปจะกลายเป็นปี 1970 จึงต้องรอ NTP ก่อนเสมอ
+unsigned long long nowEpochMs() {
+  time_t t = time(nullptr);
+  if (t < 1700000000) return 0;        // ก่อนปี 2023 = ยังไม่ sync
+  return (unsigned long long)t * 1000ULL;
+}
+// -------------------------------------------------------
+// เขียนการแจ้งเตือน 1 ใบลง water_system/notifications
+// schema ตรงกับที่ lib/notification.dart อ่าน (title/message/type/timestamp/is_read)
+bool pushNotification(const String &title, const String &message, const char *type) {
+  unsigned long long ms = nowEpochMs();
+  if (ms == 0) {
+    Serial.println("[Alert] NTP ยังไม่ sync - ยังไม่แจ้ง รอบถัดไปลองใหม่");
+    return false;
+  }
+
+  char ts[24];
+  snprintf(ts, sizeof(ts), "%llu", ms);
+
+  String payload = "{\"title\":\"";
+  payload += jsonEscape(title);
+  payload += "\",\"message\":\"";
+  payload += jsonEscape(message);
+  payload += "\",\"type\":\"";
+  payload += type;
+  payload += "\",\"timestamp\":";
+  payload += ts;
+  payload += ",\"is_read\":false}";
+
+  FirebaseJson json;
+  json.setJsonData(payload);
+  if (Firebase.pushJSON(firebaseData, "/water_system/notifications", json)) {
+    Serial.printf("[Alert] %s | %s\n", title.c_str(), message.c_str());
+    return true;
+  }
+  Serial.println("[Alert] ส่งแจ้งเตือนล้มเหลว: " + firebaseData.errorReason());
+  return false;
+}
+// -------------------------------------------------------
+// โซนระดับน้ำ (ตรงกับ TankAlertWatcher.levelZoneOf ใน Dart)
+//   0 = <=25% วิกฤต / 1 = <=50% ควรระวัง / 2 = <=75% / 3 = >75% ปกติ
+int levelZoneOf(float percent) {
+  if (percent <= ALERT_CRITICAL_PERCENT) return 0;
+  if (percent <= ALERT_WARNING_PERCENT)  return 1;
+  if (percent <= ALERT_NORMAL_PERCENT)   return 2;
+  return 3;
+}
+
+int severityOfZone(int zone) {
+  if (zone == 0) return 0;   // critical
+  if (zone == 1) return 1;   // warning
+  return 2;                  // info
+}
+
+const char *severityName(int sev) {
+  if (sev == 0) return "critical";
+  if (sev == 1) return "warning";
+  return "info";
+}
+
+// ครบ cooldown แล้วหรือยัง (slot == 0 = ยังไม่เคยแจ้ง -> แจ้งได้เลย)
+bool canEmit(unsigned long *slots, int sev) {
+  if (ALERT_COOLDOWN_MS == 0) return true;   // ปิด cooldown -> แจ้งทันทีเสมอ
+  if (slots[sev] == 0) return true;          // ยังไม่เคยแจ้งระดับนี้
+  return (millis() - slots[sev]) >= ALERT_COOLDOWN_MS;
+}
+// -------------------------------------------------------
+// ตรวจเกณฑ์ทั้ง 3 ราง แล้วแจ้งเตือนถ้าเข้าเงื่อนไข
+// ลอกตรรกะมาจาก TankAlertWatcher._handleSnapshot() ใน Dart ทั้งหมด
+void checkAlerts() {
+  if (filteredHeight < 0 || TANK_CAPACITY <= 0) return;   // ยังไม่มีข้อมูลพอ
+
+  float  percent = rawWaterPercent;
+  String pct     = String((int)roundf(percent));
+  String liters  = String((int)roundf(percent / 100.0f * TANK_CAPACITY));
+
+  // ---------- (1) ระดับน้ำข้ามโซน ----------
+  int zone = levelZoneOf(percent);
+  if (zone != lastZone) {
+    if (lastZone < 0) {
+      lastZone = zone;                 // ครั้งแรก จำเงียบ ๆ ไม่แจ้ง
+    } else {
+      int sev = severityOfZone(zone);
+      String title, message;
+      switch (zone) {
+        case 0:
+          title   = "ระดับน้ำต่ำมาก (วิกฤต)";
+          message = "ระดับน้ำเหลือ " + pct + "% (" + liters + " ลิตร) กรุณาเติมน้ำเข้าถังโดยเร็วที่สุด";
+          break;
+        case 1:
+          title   = "ระดับน้ำต่ำ (ควรระวัง)";
+          message = "ระดับน้ำเหลือ " + pct + "% (" + liters + " ลิตร) ควรเตรียมเติมน้ำไว้ล่วงหน้า";
+          break;
+        case 2:
+          title   = "ระดับน้ำ";
+          message = "ระดับน้ำ " + pct + "% (" + liters + " ลิตร)";
+          break;
+        default:
+          title   = "ระดับน้ำปกติ";
+          message = "ระดับน้ำ " + pct + "% (" + liters + " ลิตร)";
+          break;
+      }
+      if (canEmit(emitAtLevel, sev)) {
+        if (pushNotification(title, message, severityName(sev))) {
+          emitAtLevel[sev] = millis();
+          lastZone = zone;
+        }
+      }
+      // ติด cooldown -> ตั้งใจ "ไม่" commit lastZone เพื่อให้รอบถัดไปลองแจ้งใหม่
+      // (พฤติกรรมเดียวกับฝั่ง Dart ที่แก้บั๊ก "การแจ้งวิกฤตหายถาวร")
+    }
+  }
+
+  // ---------- (2) ถังน้ำเต็ม ----------
+  String full = (percent >= ALERT_FULL_PERCENT) ? "full" : "not_full";
+  if (full != lastFull) {
+    if (lastFull == "unknown" || full == "not_full") {
+      lastFull = full;                 // ครั้งแรก / น้ำลดจากเต็ม -> ไม่แจ้ง
+    } else if (canEmit(emitAtFull, 2)) {
+      String message = "ระดับน้ำ " + pct + "% (" + liters + " ลิตร) น้ำเต็มถังเรียบร้อย";
+      if (pushNotification("ถังน้ำเต็มแล้ว", message, "info")) {
+        emitAtFull[2] = millis();
+        lastFull = full;
+      }
+    }
+  }
+
+  // ---------- (3) สถานะการไหล ----------
+  // ราง flow ไม่มี cooldown (ตรงกับ kFlowCooldown = Duration.zero)
+  String flow = (lastFlowRate > ALERT_FLOW_ACTIVE_LPM) ? "flowing" : "none";
+  if (flow != lastFlow) {
+    String previous = lastFlow;
+    if (previous == "unknown" || percent >= ALERT_FULL_PERCENT) {
+      // ครั้งแรก หรือถังเต็มอยู่ (ลูกลอยปิด-เปิดวาล์วเองเป็นจังหวะ) -> เงียบทั้ง 2 ทิศทาง
+      lastFlow = flow;
+    } else if (flow == "none") {
+      if (pushNotification("น้ำหยุดไหล", "อัตราการไหลกลับมาเป็น 0 ลิตร/นาที", "critical")) {
+        lastFlow = flow;
+      }
+    } else if (previous == "none") {
+      String message = "อัตราการไหล " + String(lastFlowRate, 1) + " ลิตร/นาที";
+      if (pushNotification("น้ำกลับมาไหล", message, "info")) {
+        lastFlow = flow;
+      }
+    } else {
+      lastFlow = flow;                 // ไหลอยู่แล้วเปลี่ยนความเร็ว -> ไม่แจ้ง
+    }
+  }
+}
+// -------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
@@ -358,6 +575,10 @@ void setup() {
   if (ok) {
     showMessage("WiFi CONNECTED", WiFi.SSID(), WiFi.localIP().toString());
     initFirebase();
+    // ⏰ เริ่ม sync เวลาจาก NTP — จำเป็นสำหรับ timestamp ของการแจ้งเตือน
+    //    เป็นงานแบบ asynchronous ใช้เวลาไม่กี่วินาที pushNotification() จะรอ
+    //    จนกว่าเวลาจะใช้ได้จริงก่อนส่ง (ดู nowEpochMs)
+    configTime(GMT_OFFSET_SEC, 0, NTP_SERVER);
   } else {
     Serial.println("[WiFi] ต่อไม่สำเร็จ - ทำงานแบบ offline");
     showMessage("WiFi FAILED", "run offline", "hold BTN 3s");
@@ -429,6 +650,22 @@ void loop() {
   if (millis() - lastSampleTime >= SAMPLE_INTERVAL) {
     lastSampleTime = millis();
     updateWaterLevel();
+  }
+
+  // ---- ดึงอัตราการไหลจากบอร์ดขาเข้า (ไว้ตรวจเกณฑ์ราง flow) ----
+  //      บอร์ดนี้ไม่มี flow sensor จึงต้องอ่านค่าที่บอร์ดขาเข้าเขียนไว้
+  if (online && millis() - lastFlowPollTime >= FLOW_POLL_INTERVAL) {
+    lastFlowPollTime = millis();
+    if (Firebase.getFloat(firebaseData, "/water_system/monitor/flow_rate_min")) {
+      lastFlowRate = firebaseData.floatData();
+    }
+  }
+
+  // ---- ตรวจเกณฑ์แจ้งเตือนทุก 2 วิ แล้วเขียนลง Firebase เองถ้าเข้าเงื่อนไข ----
+  //      ทำที่บอร์ดเพื่อให้แจ้งเตือนได้แม้ผู้ใช้ปิดแอป
+  if (online && millis() - lastAlertCheckTime >= ALERT_CHECK_INTERVAL) {
+    lastAlertCheckTime = millis();
+    checkAlerts();
   }
 
   // ---- ส่งระดับน้ำขึ้น Firebase: เฉพาะตอนค่าเปลี่ยน หรือครบ 30 วิ ----
